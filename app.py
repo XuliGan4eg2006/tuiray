@@ -1,6 +1,7 @@
 """Main screen: status, menu, and the xray log pane at the bottom."""
 
 import curses
+import json
 import os
 import time
 from pathlib import Path
@@ -77,6 +78,19 @@ class App:
             proxy_state = f" · GNOME proxy: {runner.system_proxy_mode()}"
         return f"socks5 {listen}:{socks} · http {listen}:{http}{proxy_state}"
 
+    def routing_label(self) -> str:
+        """One-line summary of the split-routing rules on top of the config."""
+        parts = []
+        if self.settings.get("routing.bypass_private", True):
+            parts.append("LAN/private direct")
+        for key, noun in (("routing.direct_domains", "direct domain"),
+                          ("routing.direct_ips", "direct IP rule"),
+                          ("routing.proxy_domains", "forced-proxy domain")):
+            count = len(self.settings.get(key) or [])
+            if count:
+                parts.append(f"{count} {noun}{'s' if count > 1 else ''}")
+        return " · ".join(parts) if parts else "config rules only"
+
     def short_config(self) -> str:
         path = self.settings.config_path
         if not path:
@@ -90,6 +104,7 @@ class App:
             {"id": "config", "label": "Config", "value": self.short_config(),
              "note": self.config_summary()},
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
+            {"id": "routing", "label": "Routing", "value": self.routing_label()},
             {"id": "geoip", "label": "GeoIP data",
              "value": self._asset_value("geoip_path")},
             {"id": "geosite", "label": "GeoSite data",
@@ -131,6 +146,7 @@ class App:
 
         self._draw_body(1, 0, body_height, width, items)
         self._draw_log(1 + body_height, 0, log_height, width)
+        self._draw_traffic(body_height + log_height, 0, width)
 
         footer = ("Tab pane · Enter activate · s start/stop · R restart · p ping · "
                   "g settings · c clear log · q quit")
@@ -224,6 +240,40 @@ class App:
             elif "started" in lowered:
                 style = ui.attr(ui.OK)
             ui.addstr(stdscr, top + 1 + offset, left + 2, ui.clip(line, width - 4), style)
+
+    def _draw_traffic(self, row: int, left: int, width: int) -> None:
+        """Live rates and session totals, inlaid in the bottom-right border."""
+        stats = self.xray.stats.snapshot()
+        if not stats["ok"]:
+            if not self.xray.is_running() or not self.settings.get("stats.enabled", True):
+                return
+            segments = [("traffic: waiting for the xray API", ui.attr(ui.DIM))]
+        else:
+            segments = [
+                ("↓ ", ui.attr(ui.DIM)),
+                (ui.human_rate(stats["down_rate"]), ui.attr(ui.OK, True)),
+                ("  ↑ ", ui.attr(ui.DIM)),
+                (ui.human_rate(stats["up_rate"]), ui.attr(ui.WARN, True)),
+            ]
+            totals = [
+                ("  ·  total ↓ ", ui.attr(ui.DIM)),
+                (ui.human_bytes(stats["downlink"]), ui.attr(ui.OK)),
+                ("  ↑ ", ui.attr(ui.DIM)),
+                (ui.human_bytes(stats["uplink"]), ui.attr(ui.WARN)),
+            ]
+            # Totals are the first thing to go on a narrow terminal.
+            if sum(len(text) for text, _ in segments + totals) + 8 <= width:
+                segments += totals
+
+        span = sum(len(text) for text, _ in segments)
+        x = left + width - 2 - span
+        if x < left + 3:
+            return
+        ui.addstr(self.stdscr, row, x - 1, " ", ui.attr(ui.DIM))
+        for text, style in segments:
+            ui.addstr(self.stdscr, row, x, text, style)
+            x += len(text)
+        ui.addstr(self.stdscr, row, x, " ", ui.attr(ui.DIM))
 
     # -- actions ----------------------------------------------------------
     def start(self) -> None:
@@ -328,6 +378,14 @@ class App:
                 self.stdscr, "Restart?", f"{reason} Restart xray now to apply?"):
             self.restart()
 
+    def open_settings(self, jump_to: str = None) -> None:
+        """Settings are live-saved, so offer a restart when they actually changed."""
+        before = json.dumps(self.settings.data, sort_keys=True)
+        screens.settings_screen(self.stdscr, self.settings, jump_to=jump_to)
+        self.summary_for = None
+        if json.dumps(self.settings.data, sort_keys=True) != before:
+            self.maybe_restart("Settings changed.")
+
     def ping(self) -> None:
         chosen = screens.ping_screen(self.stdscr, self.settings)
         if chosen:
@@ -361,11 +419,12 @@ class App:
             self.toggle()
         elif item_id == "restart":
             self.restart()
+        elif item_id == "routing":
+            self.open_settings("Split routing")
         elif item_id == "ping":
             self.ping()
         elif item_id == "settings":
-            screens.settings_screen(self.stdscr, self.settings)
-            self.summary_for = None
+            self.open_settings()
         elif item_id == "quit":
             return not self.quit()
         return True
@@ -411,8 +470,7 @@ class App:
                 self.ping()
                 continue
             if key in ("g", "G"):
-                screens.settings_screen(self.stdscr, self.settings)
-                self.summary_for = None
+                self.open_settings()
                 continue
             if key in ("c", "C"):
                 self.log.clear()

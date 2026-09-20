@@ -63,6 +63,128 @@ class LogBuffer:
             return len(self._lines)
 
 
+class TrafficStats:
+    """Traffic counters read from xray's StatsService.
+
+    `xray api statsquery` is spawned once a second rather than a gRPC client
+    being written here: the binary we already depend on speaks the protocol, and
+    the TUI has no third-party dependencies on purpose. Counters are cumulative
+    since xray started, so the rates are deltas between two polls.
+    """
+
+    INTERVAL = 1.0
+    SMOOTHING = 0.6      # weight of the newest sample in the displayed rate
+
+    def __init__(self, settings):
+        self.settings = settings
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = None
+        self._port = 0
+        self._previous = None        # (monotonic, uplink, downlink)
+        self._state = self._empty()
+
+    @staticmethod
+    def _empty() -> dict:
+        return {"ok": False, "uplink": 0, "downlink": 0,
+                "up_rate": 0.0, "down_rate": 0.0}
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self, port: int) -> None:
+        self.stop()
+        if not port:
+            return
+        self._port = int(port)
+        self._previous = None
+        with self._lock:
+            self._state = self._empty()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, args=(self._stop,), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop:
+            self._stop.set()
+        self._stop = None
+        self._thread = None
+        self._previous = None
+        with self._lock:
+            self._state = self._empty()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    # -- polling ----------------------------------------------------------
+    def _loop(self, stop_event) -> None:
+        while not stop_event.is_set():
+            counters = self._query()
+            if counters is None:
+                with self._lock:
+                    self._state["ok"] = False
+                    self._state["up_rate"] = 0.0
+                    self._state["down_rate"] = 0.0
+            else:
+                self._absorb(*counters)
+            stop_event.wait(self.INTERVAL)
+
+    def _query(self):
+        """(uplink, downlink) totals across all inbounds, or None when the API is down."""
+        binary = self.settings.get("xray_bin", "")
+        if not binary:
+            return None
+        try:
+            done = subprocess.run(
+                [binary, "api", "statsquery", f"--server=127.0.0.1:{self._port}",
+                 "-t", "2", "-pattern", "inbound>>>"],
+                capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        try:
+            stats = json.loads(done.stdout).get("stat") or []
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+        uplink = downlink = 0
+        for entry in stats:
+            name = entry.get("name") or ""
+            # A zero counter comes back without its "value" field at all.
+            value = int(entry.get("value") or 0)
+            if not name.startswith("inbound>>>"):
+                continue
+            if name.endswith(">>>uplink"):
+                uplink += value
+            elif name.endswith(">>>downlink"):
+                downlink += value
+        return uplink, downlink
+
+    def _absorb(self, uplink: int, downlink: int) -> None:
+        now = time.monotonic()
+        up_rate = down_rate = 0.0
+        if self._previous:
+            before, last_up, last_down = self._previous
+            elapsed = now - before
+            # A restarted xray zeroes its counters; treat the drop as no traffic
+            # rather than as a negative rate.
+            if elapsed > 0 and uplink >= last_up and downlink >= last_down:
+                up_rate = (uplink - last_up) / elapsed
+                down_rate = (downlink - last_down) / elapsed
+        self._previous = (now, uplink, downlink)
+
+        with self._lock:
+            previous_ok = self._state["ok"]
+            weight = self.SMOOTHING if previous_ok else 1.0
+            self._state = {
+                "ok": True,
+                "uplink": uplink,
+                "downlink": downlink,
+                "up_rate": weight * up_rate + (1 - weight) * self._state["up_rate"],
+                "down_rate": weight * down_rate + (1 - weight) * self._state["down_rate"],
+            }
+
+
 # -- system helpers -------------------------------------------------------
 
 _IFACE_CACHE = {"value": "", "at": 0.0}
@@ -161,6 +283,7 @@ class XrayRunner:
         self._password = None        # in memory only, to signal a sudo'd child
         self._tail_stop = None
         self._tail_thread = None
+        self.stats = TrafficStats(settings)
 
     # -- state ------------------------------------------------------------
     @property
@@ -211,6 +334,7 @@ class XrayRunner:
         self.meta = meta
         self.log.note(f"attached to running xray (pid {pid}, mode {meta.get('mode')})")
         self._start_tail(from_start=True)
+        self.stats.start(meta.get("api_port") or 0)
         return True
 
     # -- lifecycle --------------------------------------------------------
@@ -267,6 +391,8 @@ class XrayRunner:
             raise RuntimeError("; ".join(problems))
 
         run_config = self.build()
+        stats_port = (int(self.settings.get("stats.api_port", 10815))
+                      if self.settings.get("stats.enabled", True) else 0)
         assets = self.settings.asset_dir()
         binary = self.settings.get("xray_bin")
         mode = self.settings.mode
@@ -328,9 +454,11 @@ class XrayRunner:
             "sudo": used_sudo,
             "started_at": time.time(),
             "run_config": str(run_config),
+            "api_port": stats_port,
         }
         self._write_pidfile()
         self._start_tail(from_start=True)
+        self.stats.start(stats_port)
 
         if mode == "proxy" and self.settings.get("proxy.set_system_proxy"):
             ok, message = set_system_proxy(
@@ -388,6 +516,7 @@ class XrayRunner:
         return True
 
     def _cleanup_after_stop(self) -> None:
+        self.stats.stop()
         self.process = None
         self.meta = {}
         PID_FILE.unlink(missing_ok=True)

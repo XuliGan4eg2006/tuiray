@@ -462,13 +462,22 @@ def file_browser(stdscr, start: str, title: str = "Select file",
     return result
 
 
-def human_size(path) -> str:
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return "missing"
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
+def human_bytes(size) -> str:
+    """A byte count in the largest unit that still reads as a small number."""
+    size = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024.0
     return ""
+
+
+def human_rate(per_second) -> str:
+    return f"{human_bytes(per_second)}/s"
+
+
+def human_size(path) -> str:
+    try:
+        return human_bytes(os.path.getsize(path))
+    except OSError:
+        return "missing"

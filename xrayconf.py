@@ -13,6 +13,20 @@ from pathlib import Path
 
 PROXY_PROTOCOLS = {"freedom", "blackhole", "dns", "loopback"}
 
+# Everything that must never be sent to a proxy server. In TUN mode the kernel
+# already keeps directly-connected subnets on the physical link (an on-link /24
+# beats the /1 routes xray installs), but any other private range -- a second
+# LAN behind the router, a VPN subnet, CGNAT, multicast -- would otherwise land
+# in the tunnel and die there.
+PRIVATE_RANGES = [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+    "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+]
+
+DIRECT_FALLBACK_TAG = "tuiray-direct"
+API_TAG = "api"
+
 
 def load(path) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
@@ -137,6 +151,111 @@ def tun_inbound(tun: dict, sniffing: dict) -> dict:
     }
 
 
+def direct_tag(config: dict) -> str:
+    """Tag of the outbound that reaches the internet without the proxy."""
+    outbounds = config.get("outbounds") or []
+    for outbound in outbounds:
+        if outbound.get("tag") == "direct":
+            return "direct"
+    for outbound in outbounds:
+        if outbound.get("protocol") == "freedom" and outbound.get("tag"):
+            return outbound["tag"]
+    return DIRECT_FALLBACK_TAG
+
+
+def ensure_direct_outbound(config: dict) -> str:
+    """Guarantee a direct outbound exists; returns its tag."""
+    tag = direct_tag(config)
+    if tag == DIRECT_FALLBACK_TAG:
+        config.setdefault("outbounds", []).append(
+            {"tag": DIRECT_FALLBACK_TAG, "protocol": "freedom"})
+    return tag
+
+
+def proxy_target(config: dict) -> dict:
+    """Rule fragment pointing at the proxy: a balancer when the config has one."""
+    routing = config.get("routing") or {}
+    balancers = routing.get("balancers") or []
+    if balancers and balancers[0].get("tag"):
+        return {"balancerTag": balancers[0]["tag"]}
+    for outbound in config.get("outbounds") or []:
+        if outbound.get("tag") == "proxy":
+            return {"outboundTag": "proxy"}
+    for outbound in config.get("outbounds") or []:
+        if outbound.get("protocol") not in PROXY_PROTOCOLS and outbound.get("tag"):
+            return {"outboundTag": outbound["tag"]}
+    return {}
+
+
+def routing_overrides(config: dict, rules_settings: dict) -> list:
+    """The user's split-routing rules, highest priority first.
+
+    They are prepended to the config's own rules, so they win over whatever the
+    subscription decided -- except that "force through proxy" is checked before
+    the direct rules, which is what makes it an override.
+    """
+    direct = direct_tag(config)
+    overrides = []
+
+    proxy_domains = list(rules_settings.get("proxy_domains") or [])
+    if proxy_domains:
+        target = proxy_target(config)
+        if target:
+            overrides.append({"type": "field", "domain": proxy_domains, **target})
+
+    if rules_settings.get("bypass_private", True):
+        overrides.append({"type": "field", "ip": list(PRIVATE_RANGES),
+                          "outboundTag": direct})
+
+    direct_domains = list(rules_settings.get("direct_domains") or [])
+    if direct_domains:
+        overrides.append({"type": "field", "domain": direct_domains,
+                          "outboundTag": direct})
+
+    direct_ips = list(rules_settings.get("direct_ips") or [])
+    if direct_ips:
+        overrides.append({"type": "field", "ip": direct_ips, "outboundTag": direct})
+
+    return overrides
+
+
+def apply_routing(run: dict, rules_settings: dict) -> None:
+    """Prepend the split-routing rules to a run config, in place."""
+    overrides = routing_overrides(run, rules_settings)
+    if not overrides:
+        return
+    ensure_direct_outbound(run)
+    routing = run.setdefault("routing", {})
+    routing["rules"] = overrides + list(routing.get("rules") or [])
+
+
+def apply_stats(run: dict, port: int) -> None:
+    """Turn on the traffic counters and the loopback API that reads them.
+
+    xray only counts what `policy.system` asks it to, and only answers a
+    StatsService call when an `api` block names the service. Since xray-core
+    1.8 the API can bind its own listener, so no dokodemo-door inbound and no
+    routing rule are needed -- which matters here because build_run_config()
+    replaces the inbound list wholesale.
+    """
+    run["stats"] = run.get("stats") or {}
+    policy = dict(run.get("policy") or {})
+    system = dict(policy.get("system") or {})
+    system.update({
+        "statsInboundUplink": True,
+        "statsInboundDownlink": True,
+        "statsOutboundUplink": True,
+        "statsOutboundDownlink": True,
+    })
+    policy["system"] = system
+    run["policy"] = policy
+    run["api"] = {
+        "tag": API_TAG,
+        "listen": f"127.0.0.1:{int(port)}",
+        "services": ["StatsService"],
+    }
+
+
 def build_run_config(config: dict, settings, tun_override: dict = None) -> dict:
     """The config actually handed to `xray run`, with inbounds for the mode.
 
@@ -168,11 +287,20 @@ def build_run_config(config: dict, settings, tun_override: dict = None) -> dict:
     log.pop("access", None)
     log.pop("error", None)
     run["log"] = log
+
+    apply_routing(run, settings.get("routing", {}))
+    if settings.get("stats.enabled", True):
+        apply_stats(run, int(settings.get("stats.api_port", 10815)))
     return run
 
 
 def build_ping_config(config: dict, port: int) -> dict:
-    """A throwaway config exposing one SOCKS inbound, for latency probing."""
+    """A throwaway config exposing one SOCKS inbound, for latency probing.
+
+    The user's split-routing rules are deliberately *not* applied: a probe that
+    slipped out through the direct outbound would report the latency of not
+    using the proxy at all.
+    """
     run = copy.deepcopy(config)
     run["inbounds"] = [socks_inbound("127.0.0.1", port, sniffing=_sniffing_of(config))]
     run["log"] = {"loglevel": "error"}

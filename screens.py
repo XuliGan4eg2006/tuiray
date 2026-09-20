@@ -164,8 +164,11 @@ def _as_list(text: str) -> list:
     return [part.strip() for part in (text or "").split(",") if part.strip()]
 
 
-def settings_screen(stdscr, settings) -> None:
-    """Editor for everything that is not on the main menu."""
+def settings_screen(stdscr, settings, jump_to: str = None) -> None:
+    """Editor for everything that is not on the main menu.
+
+    `jump_to` places the cursor on the first row of that section.
+    """
 
     def text_editor(key, prompt):
         def edit():
@@ -291,6 +294,32 @@ def settings_screen(stdscr, settings) -> None:
              "yes" if tun.get("keep_socks") else "no", toggle("tun.keep_socks")),
             ("item", f"xray has cap_net_admin: {caps}", "run setcap…", grant_caps),
 
+            ("section", "Split routing", "", None),
+            ("item", "Bypass LAN / private ranges",
+             "yes" if settings.get("routing.bypass_private") else "no",
+             toggle("routing.bypass_private")),
+            ("item", "Direct domains", ", ".join(settings.get("routing.direct_domains") or [])
+             or "(none)",
+             list_editor("routing.direct_domains",
+                         "Domains that skip the proxy, e.g. regexp:.*\\.ru$, "
+                         "geosite:category-ru, domain:example.com")),
+            ("item", "Direct IPs", ", ".join(settings.get("routing.direct_ips") or [])
+             or "(none)",
+             list_editor("routing.direct_ips",
+                         "IPs/CIDRs that skip the proxy, e.g. geoip:ru, 203.0.113.0/24")),
+            ("item", "Force through proxy", ", ".join(settings.get("routing.proxy_domains") or [])
+             or "(none)",
+             list_editor("routing.proxy_domains",
+                         "Domains always sent through the proxy (beats the direct rules)")),
+
+            ("section", "Traffic stats", "", None),
+            ("item", "Show traffic counters",
+             "yes" if settings.get("stats.enabled") else "no",
+             toggle("stats.enabled")),
+            ("item", "Stats API port", settings.get("stats.api_port"),
+             number_editor("stats.api_port",
+                           "Loopback port xray exposes its stats API on:")),
+
             ("section", "Ping tool", "", None),
             ("item", "Probe", MODE_LABEL.get(settings.get("ping.mode"), ""),
              choice_editor("ping.mode", "Ping mode",
@@ -309,6 +338,12 @@ def settings_screen(stdscr, settings) -> None:
     index = 1
     top = 0
     stdscr.timeout(-1)
+
+    if jump_to:
+        for position, item in enumerate(rows()):
+            if item[0] == "section" and item[1] == jump_to:
+                index = position + 1
+                break
 
     while True:
         items = rows()

@@ -65,6 +65,18 @@ DEFAULTS = {
         "outbound_interface": "auto",      # physical iface for xray's own traffic
         "keep_socks": True,                # also expose the SOCKS inbound in TUN mode
     },
+    "stats": {
+        # xray's StatsService, polled for the traffic counters in the corner.
+        "enabled": True,
+        "api_port": 10815,      # loopback-only gRPC API the TUI queries
+    },
+    "routing": {
+        # Split routing applied on top of whatever the subscription config does.
+        "bypass_private": True,      # LAN / private ranges never enter the tunnel
+        "direct_domains": [],        # e.g. "regexp:.*\\.ru$", "geosite:category-ru"
+        "direct_ips": [],            # e.g. "geoip:ru", "203.0.113.0/24"
+        "proxy_domains": [],         # forced through the proxy, beats the direct rules
+    },
     "ping": {
         "mode": "proxy",        # "proxy" (real latency through xray) | "tcp" (endpoint handshake)
         "url": "http://cp.cloudflare.com/generate_204",
@@ -108,6 +120,22 @@ class Settings:
             data["geoip_path"] = _default_path("geoip.dat")
         if not data["geosite_path"] or not Path(data["geosite_path"]).exists():
             data["geosite_path"] = _default_path("geosite.dat")
+
+        # Paths may arrive relative (CLI flags, a hand-edited file); store them
+        # absolute so the TUI works when started from any directory. A relative
+        # path is resolved against the working directory first, then the repo.
+        for key in ("xray_bin", "config_path", "configs_dir",
+                    "geoip_path", "geosite_path"):
+            value = data.get(key)
+            if not value or Path(value).is_absolute():
+                continue
+            for base in (Path.cwd(), REPO):
+                candidate = (base / value).expanduser()
+                if candidate.exists():
+                    data[key] = str(candidate.resolve())
+                    break
+            else:
+                data[key] = str((REPO / value).expanduser())
         return cls(data)
 
     def save(self) -> None:
