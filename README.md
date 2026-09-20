@@ -54,13 +54,14 @@ python3 tuiray/main.py --stop                                       # stop it
 | **Config** | file browser over `configs/` — the `.json` xray actually runs |
 | **Mode** | Proxy (local SOCKS + HTTP) or TUN (system-wide) |
 | **Routing** | split-routing rules layered on top of the config (see below) |
+| **Share** | hand the tunnel to other machines over Wi-Fi or ethernet (see below) |
 | **GeoIP / GeoSite data** | the `.dat` files; needed when a config uses `geoip:` / `geosite:` rules |
 | **Start / Stop / Restart** | runs `xray run -c …` and follows its log |
 | **Ping configs…** | latency test over every config in the configs directory |
 | **Settings…** | ports, TUN parameters, traffic stats, ping options, log level |
 
 Keys: `Tab` switch between menu and log · `Enter` activate · `s` start/stop ·
-`R` restart · `p` ping · `g` settings · `c` clear log · `q` quit.
+`R` restart · `p` ping · `w` share · `g` settings · `c` clear log · `q` quit.
 With the log pane focused, `↑ ↓ PgUp PgDn Home End` scroll it; `End` returns to
 following the tail.
 
@@ -95,8 +96,10 @@ Two details worth knowing:
   wired link can sit at metric 100 or lower, and then a `/0` from xray would lose.
   A `/1` is more specific than any default route, so capture works either way.
 * **Bypass interface** is the physical interface xray's own connections to the proxy
-  server leave by; without it the tunnel would route itself in a loop. `auto`
-  resolves to whatever `ip route get 1.1.1.1` reports (here: `wlo1`) at start time.
+  server leave by; without it the tunnel would route itself in a loop. `auto` reads
+  the default routes at start time and takes the lowest-metric one, skipping `tun0`
+  itself — `ip route get` would answer `tun0` once the tunnel is up — and skipping
+  any interface currently handed to guests, which has no way out.
 
 ### What TUN does *not* capture
 
@@ -187,6 +190,98 @@ to the generated run config. For *Force through proxy*, balancer configs get a
 Split-routing rules are **not** applied to ping probes — a probe that slipped out
 through the direct outbound would report the latency of not using the proxy at all.
 
+## Sharing the tunnel
+
+`w` from the main menu (or *Share* on it) turns this machine into a gateway: other
+devices join a Wi-Fi access point it raises, or plug into its ethernet port, and
+reach the internet through the same xray tunnel.
+
+The share screen holds everything you touch with a guest standing next to you —
+SSID, password, band, interface, gateway address and who runs DHCP, for both
+segments — editable in place with `Enter`, `s` to start or stop, and a live list of
+the guests holding a lease. `g` opens the rest (lease time, static leases, upstream
+DNS, channel) in Settings. Changing a setting while sharing is live offers to
+rebuild it, since the running share is still on the old values.
+
+The datapath is deliberately boring:
+
+```
+guest → wlo1 (AP) / enp42s0 → forward → masquerade into tun0 → xray → exit
+```
+
+Nothing in the xray config changes — from xray's point of view the guests are local
+traffic. That also means **sharing needs TUN mode**: proxy mode has no device to
+route anyone into.
+
+### Wi-Fi
+
+The Wi-Fi card becomes the access point, which means it stops being a client of your
+own network — so **the uplink has to be something else**, an ethernet cable or a USB
+NIC. tuiray refuses to start rather than cutting the branch it is sitting on:
+
+```
+no uplink left once these interfaces are shared - plug in ethernet before
+turning the Wi-Fi into an AP
+```
+
+The AP is a NetworkManager profile (`tuiray-ap`, WPA2/CCMP, `autoconnect no`), so no
+hostapd is involved. If xray was reaching the internet through that card, the tunnel
+is rebuilt against the remaining uplink as soon as the AP is up.
+
+### DHCP and DNS
+
+Each segment picks who hands out addresses:
+
+| Setting | What happens |
+|---------|--------------|
+| `dnsmasq (tuiray)` | tuiray writes the config and supervises one dnsmasq for every segment. Range, lease time, static leases and upstream DNS are yours, and the *Guests* list shows live leases. |
+| `NetworkManager shared` | `ipv4.method shared` does DHCP and NAT itself. Nothing to configure, but no client list and no static leases. |
+| `nobody` | guests set an address by hand. |
+
+Guest DNS goes to the segment's own address and dnsmasq forwards it to the resolvers
+in *Guest DNS* (`1.1.1.1` by default). Those queries leave the host, so the tunnel
+resolves them — the one thing worth getting right, since the obvious alternative is
+guests quietly using the DNS of the network you are sitting on.
+
+### What guests may and may not do
+
+| Guard | Default | Effect |
+|-------|---------|--------|
+| Isolate guests | on | no guest-to-guest, no crossing between segments, and no reaching any private range — your LAN, the docker bridges and the host's own services stay out of reach. Guests get DHCP, DNS and ping from this machine, nothing else. Two clients of the same radio are bridged inside the AP, below the IP stack where nftables never sees them, so the hotspot also gets `802-11-wireless.ap-isolation`. |
+| Kill-switch | on | a guest packet may leave only by the tunnel device. Stop xray and guests get nothing rather than a leak out of the naked uplink. |
+| MSS clamp | on | the tunnel's MTU is not the guest's MTU. |
+| IPv6 | off | shared segments are v4-only; a v6 address would be a second, untunnelled path. |
+
+### What it touches, and how it is undone
+
+| | |
+|---|---|
+| `nft` table `inet tuiray` | NAT, isolation, kill-switch, clamp — rendered to `~/.cache/tuiray/share.nft` and applied with `nft -f`, so it swings over atomically |
+| NetworkManager profiles | `tuiray-ap`, `tuiray-lan` |
+| one dnsmasq | config, leases and log under `~/.cache/tuiray/` |
+| `net.ipv4.ip_forward` | set to 1, restored to whatever it was |
+| two `iptables` rules per segment | only when the FORWARD policy is DROP (Docker does that) — an `accept` in our table cannot override a `drop` in another one |
+
+Every step is written to `~/.cache/tuiray/share.json` the moment it succeeds, and
+stopping undoes exactly what that file lists. A start that fails halfway therefore
+cleans up after itself, and so does the next run after a crash — teardown never
+depends on remembering anything in memory. Quitting asks whether to take the share
+down, exactly as it does for xray.
+
+### Privileges
+
+Raising an interface, editing the firewall and binding DHCP all need root. Run the
+whole TUI with `sudo` and it never asks; run it as your user and it asks for a sudo
+password once, keeping it in memory for the session — the same deal TUN mode already
+makes. Started through `sudo`, tuiray still reads and writes settings as *you*, not
+as root, so nothing in `~/.config` or `~/.cache` changes hands.
+
+### Not in this version
+
+AP and client mode on the *same* card at once (it needs a second virtual interface
+plus hostapd, and one shared channel), transparent proxying for guests while the host
+stays in proxy mode, and per-client traffic counters.
+
 ## Ping tool
 
 `p` from the main menu tests every `*.json` under the configs directory and sorts by
@@ -211,6 +306,9 @@ leave the screen.
 | `~/.cache/tuiray/xray.log` | xray output, tailed by the log pane |
 | `~/.cache/tuiray/xray.pid` | pid/mode/config of the running instance, for re-attaching |
 | `~/.cache/tuiray/assets/` | symlinks named `geoip.dat` / `geosite.dat`, passed as `XRAY_LOCATION_ASSET` |
+| `~/.cache/tuiray/share.json` | what sharing changed on the machine, so it can be undone |
+| `~/.cache/tuiray/share.nft` | the generated nft ruleset, exactly as applied |
+| `~/.cache/tuiray/dnsmasq.{conf,leases,log}` | the DHCP/DNS server for the shared segments |
 
 The selected config is never modified: it is copied, its `inbounds` replaced for the
 mode, and the copy is what runs. Routing, DNS, balancers and outbounds are untouched.
@@ -224,6 +322,7 @@ screens.py    ping tool and settings screens
 ui.py         curses widgets: frames, popups, file browser
 runner.py     process lifecycle, log tail, traffic stats poller, sudo/setcap, GNOME proxy
 pinger.py     SOCKS5 and TCP latency probes, worker pool
+share.py      Wi-Fi AP and wired sharing: NM profiles, dnsmasq, nft, teardown
 xrayconf.py   config loading, inbound rewriting for proxy/TUN, stats API block
 settings.py   persisted settings
 ```

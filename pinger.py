@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import xrayconf
-from settings import CACHE_DIR
+from settings import CACHE_DIR, mkdir_owned
 
 PING_DIR = CACHE_DIR / "ping"
 
@@ -166,7 +166,7 @@ def probe_proxy(path: Path, settings, timeout: float, attempts: int, on_spawn=No
     """(ms, detail) through a private xray instance; raises on failure."""
     config = xrayconf.load(path)
     port = free_port()
-    PING_DIR.mkdir(parents=True, exist_ok=True)
+    mkdir_owned(PING_DIR)
     run_config = PING_DIR / f"probe-{port}.json"
     xrayconf.write(xrayconf.build_ping_config(config, port), run_config)
 

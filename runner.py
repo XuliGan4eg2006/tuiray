@@ -22,7 +22,7 @@ from collections import deque
 from pathlib import Path
 
 import xrayconf
-from settings import CACHE_DIR
+from settings import CACHE_DIR, chown_back, mkdir_owned
 
 RUN_CONFIG = CACHE_DIR / "run.json"
 LOG_FILE = CACHE_DIR / "xray.log"
@@ -187,26 +187,57 @@ class TrafficStats:
 
 # -- system helpers -------------------------------------------------------
 
-_IFACE_CACHE = {"value": "", "at": 0.0}
+_IFACE_CACHE = {}          # exclusion key -> (interface, read at)
 
 
-def detect_default_interface(max_age: float = 10.0) -> str:
-    """Physical interface of the default route -- what TUN mode must bypass.
+def detect_default_interface(exclude=(), max_age: float = 10.0) -> str:
+    """Physical interface xray's own traffic should leave by.
 
-    Cached: the main screen asks for this on every repaint.
+    Deliberately not `ip route get`: once the tunnel is up that answers "tun0",
+    and handing xray its own device as the bypass interface makes it route
+    itself in a loop. The default routes are read instead -- lowest metric
+    first -- skipping the tunnel device and any interface handed to guests,
+    which has no way out once it is an access point.
+
+    Cached per exclusion set: the main screen asks on every repaint.
     """
-    if _IFACE_CACHE["value"] and time.time() - _IFACE_CACHE["at"] < max_age:
-        return _IFACE_CACHE["value"]
+    key = tuple(sorted(exclude))
+    cached = _IFACE_CACHE.get(key)
+    if cached and time.time() - cached[1] < max_age:
+        return cached[0]
+    routes = []
     try:
-        out = subprocess.run(["ip", "route", "get", "1.1.1.1"],
+        out = subprocess.run(["ip", "-4", "route", "show", "default"],
                              capture_output=True, text=True, timeout=3).stdout
-        match = re.search(r"\bdev\s+(\S+)", out)
-        if match:
-            _IFACE_CACHE.update(value=match.group(1), at=time.time())
-            return match.group(1)
+        for line in out.splitlines():
+            device = re.search(r"\bdev\s+(\S+)", line)
+            if not device or device.group(1) in exclude:
+                continue
+            metric = re.search(r"\bmetric\s+(\d+)", line)
+            routes.append((int(metric.group(1)) if metric else 0, device.group(1)))
     except (OSError, subprocess.SubprocessError):
         pass
-    return ""
+    if not routes:
+        return ""
+    value = min(routes)[1]
+    _IFACE_CACHE[key] = (value, time.time())
+    return value
+
+
+def shared_interfaces(settings) -> set:
+    """Interfaces tuiray hands to guests, named in the settings.
+
+    Read from settings rather than from share.py, which imports this module.
+    ShareManager writes the interface it actually picked back into settings, so
+    an "auto" choice is visible here too.
+    """
+    found = set()
+    for kind in ("wifi", "lan"):
+        config = settings.get(f"share.{kind}", {}) or {}
+        name = (config.get("iface") or "").strip()
+        if config.get("enabled") and name:
+            found.add(name)
+    return found
 
 
 def binary_has_net_caps(path: str) -> bool:
@@ -218,6 +249,21 @@ def binary_has_net_caps(path: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return "cap_net_admin" in out.lower()
+
+
+# One credential for the whole TUI: xray in TUN mode and the share manager both
+# need root, and asking twice in one session for the same password is just rude.
+# In memory only -- it is never written anywhere.
+_CREDENTIAL = {"password": None}
+
+
+def remember_password(password: str) -> None:
+    if password:
+        _CREDENTIAL["password"] = password
+
+
+def cached_password():
+    return _CREDENTIAL["password"]
 
 
 def sudo_ready() -> bool:
@@ -373,7 +419,8 @@ class XrayRunner:
         """TUN block with "auto" resolved to the real default interface."""
         tun = dict(self.settings.get("tun", {}))
         if (tun.get("outbound_interface") or "auto").strip() == "auto":
-            tun["outbound_interface"] = detect_default_interface()
+            exclude = {tun.get("name") or "tun0"} | shared_interfaces(self.settings)
+            tun["outbound_interface"] = detect_default_interface(exclude)
         return tun
 
     def build(self) -> Path:
@@ -381,11 +428,14 @@ class XrayRunner:
         config = xrayconf.load(self.settings.config_path)
         tun = self.effective_tun() if self.settings.mode == "tun" else None
         run = xrayconf.build_run_config(config, self.settings, tun_override=tun)
-        return xrayconf.write(run, RUN_CONFIG)
+        path = xrayconf.write(run, RUN_CONFIG)
+        chown_back(path)
+        return path
 
     def start(self, password: str = None) -> None:
         if self.is_running():
             return
+        password = password or cached_password()
         problems = self.preflight()
         if problems:
             raise RuntimeError("; ".join(problems))
@@ -406,6 +456,7 @@ class XrayRunner:
                 cmd = ["sudo", "-S", "-p", "", "env", f"XRAY_LOCATION_ASSET={assets}"] + base
                 stdin_data = password + "\n"
                 self._password = password
+                remember_password(password)
             elif sudo_ready():
                 cmd = ["sudo", "-n", "env", f"XRAY_LOCATION_ASSET={assets}"] + base
             else:
@@ -414,8 +465,9 @@ class XrayRunner:
         else:
             cmd = base
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        mkdir_owned(CACHE_DIR)
         LOG_FILE.write_text("", encoding="utf-8")       # each run starts clean
+        chown_back(LOG_FILE)
         self.log.clear()
         self.log.note(f"$ {' '.join(shlex.quote(part) for part in cmd)}")
         self.log.note(f"mode={mode}  config={self.settings.config_path}")
@@ -455,6 +507,10 @@ class XrayRunner:
             "started_at": time.time(),
             "run_config": str(run_config),
             "api_port": stats_port,
+            # Remembered so sharing can tell when the interface xray leaves by
+            # is one it is about to hand to guests.
+            "tun_interface": (self.effective_tun().get("outbound_interface") or ""
+                              if mode == "tun" else ""),
         }
         self._write_pidfile()
         self._start_tail(from_start=True)
@@ -475,6 +531,7 @@ class XrayRunner:
 
         if password:
             self._password = password
+            remember_password(password)
         pid = self.pid
         if self.meta.get("sudo"):
             self._sudo_stop(pid, "TERM")
@@ -532,16 +589,18 @@ class XrayRunner:
 
     def _sudo_stop(self, pid: int, signal_name: str) -> None:
         """Signal the root-owned xray running under our sudo child."""
+        password = self._password or cached_password()
         targets = [str(child) for child in _descendants(pid)] + [str(pid)]
-        if sudo_run(["kill", f"-{signal_name}"] + targets, self._password, timeout=15)[0]:
+        if sudo_run(["kill", f"-{signal_name}"] + targets, password, timeout=15)[0]:
             return
         run_config = self.meta.get("run_config", str(RUN_CONFIG))
         sudo_run(["pkill", f"-{signal_name}", "-f", f"run -c {run_config}"],
-                 self._password, timeout=15)
+                 password, timeout=15)
 
     def _write_pidfile(self) -> None:
         try:
             PID_FILE.write_text(json.dumps(self.meta), encoding="utf-8")
+            chown_back(PID_FILE)
         except OSError:
             pass
 
@@ -591,9 +650,27 @@ class XrayRunner:
 PREV_PROXY_MODE = CACHE_DIR / "sysproxy.prev"
 
 
+def _desktop_prefix() -> list:
+    """Argv prefix that runs a desktop command as the user, not as root.
+
+    Started through sudo there is no session bus for root, so gsettings would
+    fail outright or write into a throwaway dconf profile that no running
+    desktop ever reads. Hand it back to the invoking user with their own bus.
+    """
+    if os.geteuid() != 0:
+        return []
+    user, uid = os.environ.get("SUDO_USER"), os.environ.get("SUDO_UID")
+    if not user or not uid:
+        return []
+    return ["sudo", "-u", user, "env",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}"]
+
+
 def _gsettings(args: list) -> tuple:
     try:
-        done = subprocess.run(["gsettings"] + args, capture_output=True, text=True, timeout=5)
+        done = subprocess.run(_desktop_prefix() + ["gsettings"] + args,
+                              capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     if done.returncode != 0:
@@ -607,8 +684,9 @@ def set_system_proxy(host: str, socks_port: int, http_port: int) -> tuple:
     ok, previous = _gsettings(["get", "org.gnome.system.proxy", "mode"])
     if ok:
         try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            mkdir_owned(CACHE_DIR)
             PREV_PROXY_MODE.write_text(previous.strip().strip("'"), encoding="utf-8")
+            chown_back(PREV_PROXY_MODE)
         except OSError:
             pass
 

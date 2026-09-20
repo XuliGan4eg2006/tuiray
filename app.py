@@ -8,6 +8,7 @@ from pathlib import Path
 
 import runner
 import screens
+import share
 import ui
 import xrayconf
 
@@ -20,6 +21,7 @@ class App:
         self.settings = settings
         self.log = runner.LogBuffer(int(settings.get("log_lines", 3000)))
         self.xray = runner.XrayRunner(settings, self.log)
+        self.share = share.ShareManager(settings, self.log)
         self.focus = "menu"          # menu | log
         self.index = 0
         self.menu_top = 0            # first menu row drawn, for short terminals
@@ -105,6 +107,7 @@ class App:
              "note": self.config_summary()},
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
             {"id": "routing", "label": "Routing", "value": self.routing_label()},
+            {"id": "share", "label": "Share", "value": self.share.summary()},
             {"id": "geoip", "label": "GeoIP data",
              "value": self._asset_value("geoip_path")},
             {"id": "geosite", "label": "GeoSite data",
@@ -149,7 +152,7 @@ class App:
         self._draw_traffic(body_height + log_height, 0, width)
 
         footer = ("Tab pane · Enter activate · s start/stop · R restart · p ping · "
-                  "g settings · c clear log · q quit")
+                  "w share · g settings · c clear log · q quit")
         if self.message and time.time() < self.message_until:
             footer = self.message
         ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
@@ -386,23 +389,37 @@ class App:
         if json.dumps(self.settings.data, sort_keys=True) != before:
             self.maybe_restart("Settings changed.")
 
+    def open_share(self) -> None:
+        screens.share_screen(self.stdscr, self.settings, self.share,
+                             self.xray, self.restart)
+
     def ping(self) -> None:
         chosen = screens.ping_screen(self.stdscr, self.settings)
         if chosen:
             self.use_config(chosen)
 
     def quit(self) -> bool:
-        if not self.xray.is_running():
-            return True
-        picked = ui.popup_list(
-            self.stdscr, "xray is running",
-            [("Stop xray and quit", "the tunnel/proxy goes away"),
-             ("Leave it running and quit", "reattach next time you start tuiray"),
-             ("Cancel", "")], 0)
-        if picked is None or picked == 2:
-            return False
-        if picked == 0:
-            self.stop()
+        if self.xray.is_running():
+            picked = ui.popup_list(
+                self.stdscr, "xray is running",
+                [("Stop xray and quit", "the tunnel/proxy goes away"),
+                 ("Leave it running and quit", "reattach next time you start tuiray"),
+                 ("Cancel", "")], 0)
+            if picked is None or picked == 2:
+                return False
+            if picked == 0:
+                self.stop()
+        if self.share.is_active():
+            picked = ui.popup_list(
+                self.stdscr, "sharing is live",
+                [("Stop sharing and quit", "the access point and DHCP go away"),
+                 ("Leave it up and quit",
+                  "profiles, rules and DHCP stay; tuiray picks them up next run"),
+                 ("Cancel", "")], 0)
+            if picked is None or picked == 2:
+                return False
+            if picked == 0:
+                screens.share_stop(self.stdscr, self.share)
         return True
 
     def activate(self, item_id: str) -> bool:
@@ -421,6 +438,8 @@ class App:
             self.restart()
         elif item_id == "routing":
             self.open_settings("Split routing")
+        elif item_id == "share":
+            self.open_share()
         elif item_id == "ping":
             self.ping()
         elif item_id == "settings":
@@ -468,6 +487,9 @@ class App:
                 continue
             if key in ("p", "P"):
                 self.ping()
+                continue
+            if key in ("w", "W"):
+                self.open_share()
                 continue
             if key in ("g", "G"):
                 self.open_settings()
