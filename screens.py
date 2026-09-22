@@ -3,6 +3,7 @@
 import curses
 import json
 import os
+import threading
 from pathlib import Path
 
 import pinger
@@ -10,6 +11,7 @@ import runner
 import share
 import ui
 import xrayconf
+import xrayget
 
 
 # -- ping tool ------------------------------------------------------------
@@ -166,6 +168,119 @@ def ping_screen(stdscr, settings) -> str:
     return chosen
 
 
+# -- downloading xray -----------------------------------------------------
+
+def _human_mb(size) -> str:
+    return f"{size / 1048576:.1f} MB"
+
+
+def download_screen(stdscr, settings) -> str:
+    """Fetch and install the newest Xray-core release; returns the binary path.
+
+    The work happens in a thread so the bar keeps moving and Esc stays live --
+    a 20 MB download over a bad link is exactly when a frozen UI is worst.
+    """
+    target = xrayget.install_dir()
+    try:
+        label = xrayget.platform_label()
+    except Exception as exc:                       # unknown platform
+        ui.popup_message(stdscr, "Cannot download", str(exc), ui.ERROR)
+        return None
+    if not ui.popup_confirm(stdscr, "Download xray",
+                            f"{label}\n\nThe newest release (or prerelease) will be "
+                            f"installed into\n{target}\n\nDownload it now?"):
+        return None
+
+    # The zip carries the .dat files too; only replace ones already in place
+    # when asked -- a curated geosite.dat is not ours to overwrite.
+    have_assets = all(Path(settings.get(key) or "").exists()
+                      for key in ("geoip_path", "geosite_path"))
+    with_assets = True
+    if have_assets:
+        with_assets = ui.popup_confirm(
+            stdscr, "Data files",
+            "The release also ships geoip.dat and geosite.dat.\n"
+            "Replace the ones you have with the new ones?", default_yes=False)
+
+    state = {"phase": "starting…", "done": 0, "total": 0,
+             "error": "", "result": None, "cancelled": False}
+    cancel = threading.Event()
+
+    def progress(phase, done, total):
+        state.update(phase=phase, done=done, total=total)
+
+    def work():
+        try:
+            state["result"] = xrayget.fetch(settings, with_assets, progress, cancel)
+        except xrayget.Cancelled:
+            state["cancelled"] = True
+        except Exception as exc:                   # network, zip, disk, anything
+            state["error"] = str(exc) or exc.__class__.__name__
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    stdscr.timeout(120)
+
+    while worker.is_alive():
+        height, width = stdscr.getmaxyx()
+        box_width = min(width - 4, 72)
+        box_height = 9
+        top = max(0, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
+
+        stdscr.erase()
+        ui.draw_frame(stdscr, top, left, box_height, box_width,
+                      "Downloading xray", focused=True)
+        ui.addstr(stdscr, top + 1, left + 2, ui.clip(label, box_width - 4), ui.attr(ui.DIM))
+        ui.addstr(stdscr, top + 2, left + 2, ui.clip(state["phase"], box_width - 4),
+                  ui.attr(ui.NORMAL))
+
+        done, total = state["done"], state["total"]
+        bar_width = box_width - 6
+        filled = int(bar_width * done / total) if total else 0
+        ui.addstr(stdscr, top + 4, left + 3, "█" * filled, ui.attr(ui.OK, True))
+        ui.addstr(stdscr, top + 4, left + 3 + filled, "░" * (bar_width - filled),
+                  ui.attr(ui.DIM))
+        if total:
+            counter = f"{_human_mb(done)} of {_human_mb(total)}  ({done * 100 // total}%)"
+            ui.addstr(stdscr, top + 5, left + 3, counter, ui.attr(ui.DIM))
+
+        ui.addstr(stdscr, top + box_height - 2, left + 2, "Esc cancel", ui.attr(ui.KEYHINT))
+        stdscr.refresh()
+
+        key = ui.getkey(stdscr)
+        if key is not None and (ui.is_escape(key) or key in ("q", "Q")):
+            cancel.set()
+            state["phase"] = "cancelling…"
+    worker.join(timeout=1)
+    stdscr.timeout(-1)
+
+    if state["cancelled"]:
+        ui.popup_message(stdscr, "Cancelled", "Nothing was installed.", ui.WARN)
+        return None
+    if state["error"]:
+        ui.popup_message(stdscr, "Download failed", state["error"], ui.ERROR)
+        return None
+
+    result = state["result"]
+    installed = result["installed"]
+    binary = installed.get(xrayget.binary_name())
+    settings.set("xray_bin", str(binary))
+    for key, name in (("geoip_path", "geoip.dat"), ("geosite_path", "geosite.dat")):
+        if name in installed:
+            settings.set(key, str(installed[name]))
+    settings.asset_dir()                           # refresh the symlink farm
+
+    version = xrayget.installed_version(str(binary)) or result["tag"]
+    lines = [f"{version} installed into {result['target']}",
+             "",
+             "checksum verified against the release .dgst" if result["verified"]
+             else "the release published no checksum for this asset"]
+    lines += [f"  {name}" for name in sorted(installed)]
+    ui.popup_message(stdscr, "Done", "\n".join(lines), ui.OK)
+    return str(binary)
+
+
 # -- settings -------------------------------------------------------------
 
 def _as_list(text: str) -> list:
@@ -246,6 +361,11 @@ class _Editors:
             path = ui.file_browser(self.stdscr, start, title, extensions=extensions)
             if path:
                 self.settings.set(key, path)
+        return edit
+
+    def download_xray(self):
+        def edit():
+            download_screen(self.stdscr, self.settings)
         return edit
 
     def dir(self, key, title):
@@ -332,6 +452,9 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
             ("section", "Paths", "", None),
             ("item", "xray binary", settings.get("xray_bin") or "(not set)",
              edit.file("xray_bin", "Select xray binary", None)),
+            ("item", "Download / update xray",
+             xrayget.installed_version(settings.get("xray_bin", "")) or "(not installed)",
+             edit.download_xray()),
             ("item", "Configs directory", settings.get("configs_dir") or "(not set)",
              edit.dir("configs_dir", "Select configs directory")),
             ("item", "GeoIP file", asset_value(settings, "geoip_path"),

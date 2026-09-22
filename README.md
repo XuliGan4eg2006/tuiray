@@ -39,7 +39,8 @@ python3 tuiray/main.py          # or ./tuiray/main.py
 ```
 
 On first start it finds the `xray` binary, `configs/`, `geoip.dat` and `geosite.dat`
-next to the repo. Everything is changeable from the UI.
+next to the repo. Everything is changeable from the UI — and if there is no xray
+binary at all, the menu offers to **download one** for this machine (see below).
 
 Command line extras:
 
@@ -59,6 +60,7 @@ the bottom of the screen.
 
 | Row | What it does |
 |-----|--------------|
+| **Get xray** | only shown when there is no binary: downloads the newest release for this machine (see below) |
 | **Config** | file browser over `configs/` — the `.json` xray actually runs |
 | **Mode** | Proxy (local SOCKS + HTTP) or TUN (system-wide) |
 | **System proxy** | point the desktop's proxy settings at our inbounds while xray runs (see below) |
@@ -131,6 +133,45 @@ Creating the device and editing the routing table needs `CAP_NET_ADMIN`. Either:
 * **sudo** — leave it as is and the TUI asks for your sudo password when starting in
   TUN mode (kept in memory only, for the lifetime of the TUI, so it can also stop
   the root-owned process).
+
+## Getting xray
+
+With no binary configured, the menu grows a **Get xray** row at the top, and
+pressing Start offers the same thing. *Settings → Paths → Download / update xray*
+does it at any time and shows the version currently installed.
+
+It asks the GitHub API for
+[XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases) and takes the newest
+entry, **release or prerelease** — Xray marks every build a prerelease, so
+"latest stable" would find nothing at all.
+
+The asset is picked from `uname`, because this tool is run on boards as often as
+on laptops:
+
+| `platform.machine()` | Asset |
+|----------------------|-------|
+| `x86_64` / `amd64` | `Xray-linux-64.zip` |
+| `i386` … `i686` | `Xray-linux-32.zip` |
+| `aarch64` / `arm64` | `Xray-linux-arm64-v8a.zip` |
+| `armv7l` / `armhf` | `Xray-linux-arm32-v7a.zip` |
+| `armv6l` | `Xray-linux-arm32-v6.zip` |
+| `armv5tel` / `armv5l` | `Xray-linux-arm32-v5.zip` |
+| `riscv64`, `loongarch64`, `ppc64`, `ppc64le`, `s390x` | the matching `Xray-linux-*.zip` |
+| `mips*` | `mips32`/`mips64`, with `le` chosen from the interpreter's byte order rather than from the name |
+
+macOS, FreeBSD, OpenBSD, Windows and Android names are mapped too, and a
+combination upstream does not build (`Windows/armv7l`, say) is reported as
+"*tag* has no *asset*" rather than downloading something that cannot run.
+
+The zip is checked against the `SHA2-256` line of the `.dgst` file the release
+publishes beside it; a mismatch installs nothing. It also carries `geoip.dat` and
+`geosite.dat`: missing ones are always installed, and existing ones are only
+replaced if you say so. Everything lands next to the repo (or in
+`~/.cache/tuiray/bin` when the repo is not writable), the settings are pointed at
+it, and the binary is written to a temporary name and renamed into place — you
+cannot get `Text file busy` by updating xray while it runs.
+
+The download is a background thread: the bar moves, and `Esc` cancels it.
 
 ## System proxy
 
@@ -440,5 +481,6 @@ pinger.py     SOCKS5 and TCP latency probes, worker pool
 watchdog.py   periodic proxy/internet health checks and the config switch
 share.py      Wi-Fi AP and wired sharing: NM profiles, dnsmasq, nft, teardown
 xrayconf.py   config loading, inbound rewriting for proxy/TUN, stats API block
+xrayget.py    platform detection and the release download for the xray binary
 settings.py   persisted settings
 ```

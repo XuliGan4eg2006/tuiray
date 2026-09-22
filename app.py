@@ -12,6 +12,7 @@ import share
 import ui
 import watchdog
 import xrayconf
+import xrayget
 
 SEPARATOR = {"id": "sep"}
 
@@ -98,9 +99,19 @@ class App:
         parent = Path(path).parent.name
         return f"{parent}/{Path(path).name}" if parent else Path(path).name
 
+    def has_binary(self) -> bool:
+        binary = self.settings.get("xray_bin") or ""
+        return bool(binary) and Path(binary).is_file()
+
     def menu(self) -> list:
         running = self.xray.is_running()
-        return [
+        rows = []
+        if not self.has_binary():
+            # Nothing else on this screen can work without it, so it goes first.
+            rows.append({"id": "getxray", "label": "Get xray",
+                         "value": "download the newest release from GitHub",
+                         "accent": True})
+        return rows + [
             {"id": "config", "label": "Config", "value": self.short_config(),
              "note": self.config_summary()},
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
@@ -445,6 +456,14 @@ class App:
     def start(self) -> None:
         if self.xray.is_running():
             return
+        if not self.has_binary():
+            if not ui.popup_confirm(self.stdscr, "No xray binary",
+                                    "There is no xray binary to run.\n\n"
+                                    "Download the newest release from GitHub now?"):
+                return
+            self.download_xray()
+            if not self.has_binary():
+                return
         try:
             self.xray.start()
         except runner.NeedsPassword:
@@ -552,6 +571,13 @@ class App:
         screens.share_screen(self.stdscr, self.settings, self.share,
                              self.xray, self.restart)
 
+    def download_xray(self) -> None:
+        path = screens.download_screen(self.stdscr, self.settings)
+        if not path:
+            return
+        self._problems_at = 0.0          # the Status card is stale now
+        self.notify(f"xray installed: {path}", 6)
+
     def toggle_system_proxy(self) -> None:
         """Hand the desktop our inbounds, or give it back what it had."""
         enable = not bool(self.settings.get("proxy.set_system_proxy"))
@@ -651,6 +677,8 @@ class App:
             self.open_watchdog()
         elif item_id == "sysproxy":
             self.toggle_system_proxy()
+        elif item_id == "getxray":
+            self.download_xray()
         elif item_id == "ping":
             self.ping()
         elif item_id == "settings":

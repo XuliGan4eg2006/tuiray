@@ -393,7 +393,7 @@ class XrayRunner:
         problems = []
         binary = self.settings.get("xray_bin", "")
         if not binary or not Path(binary).is_file():
-            problems.append("xray binary not found - set it in Settings")
+            problems.append("no xray binary - download it from the menu")
         elif not os.access(binary, os.X_OK):
             problems.append(f"{binary} is not executable")
 

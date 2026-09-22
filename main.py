@@ -71,8 +71,9 @@ def main() -> int:
         return 0
 
     if not config.get("xray_bin"):
-        print("No xray binary found. Put one next to this repo or on $PATH, "
-              "or set it in Settings once the TUI is open.", file=sys.stderr)
+        print("No xray binary found. The TUI offers to download the newest "
+              "release for this machine; you can also put one next to this "
+              "repo or on $PATH, or set it in Settings.", file=sys.stderr)
 
     os.environ.setdefault("ESCDELAY", "25")     # snappier Esc handling
     curses.wrapper(_run, config)
