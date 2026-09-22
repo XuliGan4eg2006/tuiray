@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -22,7 +23,7 @@ from collections import deque
 from pathlib import Path
 
 import xrayconf
-from settings import CACHE_DIR, chown_back, mkdir_owned
+from settings import CACHE_DIR, CONFIG_HOME, chown_back, mkdir_owned
 
 RUN_CONFIG = CACHE_DIR / "run.json"
 LOG_FILE = CACHE_DIR / "xray.log"
@@ -656,9 +657,25 @@ class XrayRunner:
             stop_event.wait(0.25)
 
 
-# -- GNOME system proxy ---------------------------------------------------
+# -- system proxy ---------------------------------------------------------
+#
+# The tactic is the one Throne (and Qv2ray before it) uses: tell every desktop
+# proxy store on the machine at once, because no single one of them is "the"
+# system proxy on Linux.
+#
+#   * GNOME, Cinnamon, MATE, Budgie, XFCE-with-gsettings and every GTK app that
+#     reads GProxyResolver -> the org.gnome.system.proxy gsettings tree.
+#   * KDE/Plasma (and Trinity) -> [Proxy Settings] in ~/.config/kioslaverc,
+#     written with kwriteconfig, followed by a D-Bus signal so the running
+#     KIO workers re-read it instead of waiting for a logout.
+#
+# What tuiray adds on top is symmetry: the previous state of both stores is
+# remembered, so stopping puts the machine back where it was instead of
+# blanket-setting "no proxy" the way Throne does.
 
-PREV_PROXY_MODE = CACHE_DIR / "sysproxy.prev"
+PREV_PROXY_STATE = CACHE_DIR / "sysproxy.prev"
+KIOSLAVERC = CONFIG_HOME / "kioslaverc"
+KDE_GROUP = "Proxy Settings"
 
 
 def _desktop_prefix() -> list:
@@ -678,38 +695,34 @@ def _desktop_prefix() -> list:
             f"XDG_RUNTIME_DIR=/run/user/{uid}"]
 
 
-def _gsettings(args: list) -> tuple:
+def _desktop_run(program: str, args: list, timeout: float = 5.0) -> tuple:
+    """Run a desktop helper as the invoking user; (ok, output-or-error)."""
+    if not shutil.which(program):
+        return False, f"{program} not found"
     try:
-        done = subprocess.run(_desktop_prefix() + ["gsettings"] + args,
-                              capture_output=True, text=True, timeout=5)
+        done = subprocess.run(_desktop_prefix() + [program] + args,
+                              capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     if done.returncode != 0:
-        return False, (done.stderr or "gsettings failed").strip()
+        return False, (done.stderr or done.stdout or f"{program} failed").strip()
     return True, done.stdout.strip()
 
 
-def set_system_proxy(host: str, socks_port: int, http_port: int) -> tuple:
-    # Remember what the desktop had, so stopping restores it instead of
-    # blindly switching the machine to "no proxy".
-    ok, previous = _gsettings(["get", "org.gnome.system.proxy", "mode"])
-    if ok:
-        try:
-            mkdir_owned(CACHE_DIR)
-            PREV_PROXY_MODE.write_text(previous.strip().strip("'"), encoding="utf-8")
-            chown_back(PREV_PROXY_MODE)
-        except OSError:
-            pass
+# -- GNOME (gsettings) ----------------------------------------------------
 
-    steps = [
-        ["set", "org.gnome.system.proxy", "mode", "manual"],
-        ["set", "org.gnome.system.proxy.socks", "host", host],
-        ["set", "org.gnome.system.proxy.socks", "port", str(socks_port)],
-        ["set", "org.gnome.system.proxy.http", "host", host],
-        ["set", "org.gnome.system.proxy.http", "port", str(http_port)],
-        ["set", "org.gnome.system.proxy.https", "host", host],
-        ["set", "org.gnome.system.proxy.https", "port", str(http_port)],
-    ]
+def _gsettings(args: list) -> tuple:
+    return _desktop_run("gsettings", args)
+
+
+def _gnome_apply(host: str, socks_port: int, http_port: int) -> tuple:
+    steps = [["set", "org.gnome.system.proxy", "mode", "manual"],
+             ["set", "org.gnome.system.proxy.socks", "host", host],
+             ["set", "org.gnome.system.proxy.socks", "port", str(socks_port)]]
+    # http, https and ftp all go to the HTTP inbound, as Throne does.
+    for protocol in ("http", "https", "ftp"):
+        steps.append(["set", f"org.gnome.system.proxy.{protocol}", "host", host])
+        steps.append(["set", f"org.gnome.system.proxy.{protocol}", "port", str(http_port)])
     for step in steps:
         ok, message = _gsettings(step)
         if not ok:
@@ -717,28 +730,176 @@ def set_system_proxy(host: str, socks_port: int, http_port: int) -> tuple:
     return True, ""
 
 
-def clear_system_proxy() -> tuple:
-    previous = "none"
+def _gnome_mode() -> str:
+    ok, value = _gsettings(["get", "org.gnome.system.proxy", "mode"])
+    return value.strip().strip("'") if ok else ""
+
+
+# -- KDE (kioslaverc) -----------------------------------------------------
+
+def _kde_tool(kind: str) -> str:
+    """kwriteconfig/kreadconfig binary for this Plasma generation, or ""."""
+    version = os.environ.get("KDE_SESSION_VERSION", "")
+    order = [f"{kind}{version}"] if version in ("5", "6") else []
+    order += [f"{kind}6", f"{kind}5", kind]
+    for name in order:
+        if shutil.which(name):
+            return name
+    return ""
+
+
+def is_kde() -> bool:
+    """Is there a KDE proxy store worth writing to?
+
+    The desktop name decides it when we have one. Under sudo the variable is
+    usually stripped, so fall back to "are the KDE tools even installed" --
+    which is false on a machine that has no KDE to configure.
+    """
+    desktops = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if desktops:
+        return any(name in desktops for name in ("kde", "plasma", "trinity"))
+    return bool(_kde_tool("kwriteconfig"))
+
+
+def _kde_write(key: str, value: str) -> tuple:
+    tool = _kde_tool("kwriteconfig")
+    if not tool:
+        return False, "kwriteconfig not found"
+    ok, message = _desktop_run(tool, ["--file", str(KIOSLAVERC), "--group", KDE_GROUP,
+                                      "--key", key, value])
+    if ok:
+        chown_back(KIOSLAVERC)
+    return ok, message
+
+
+def _kde_read(key: str) -> str:
+    tool = _kde_tool("kreadconfig")
+    if not tool:
+        return ""
+    ok, value = _desktop_run(tool, ["--file", str(KIOSLAVERC), "--group", KDE_GROUP,
+                                    "--key", key])
+    return value.strip() if ok else ""
+
+
+def _kde_reload() -> None:
+    """Tell the running KIO workers to re-read kioslaverc."""
+    _desktop_run("dbus-send", ["--type=signal", "/KIO/Scheduler",
+                               "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                               "string:''"])
+
+
+def _kde_apply(host: str, socks_port: int, http_port: int) -> tuple:
+    entries = [("socksProxy", f"socks://{host} {socks_port}")]
+    for protocol in ("http", "https", "ftp"):
+        entries.append((f"{protocol}Proxy", f"http://{host} {http_port}"))
+    entries.append(("ProxyType", "1"))          # 1 = manual
+    for key, value in entries:
+        ok, message = _kde_write(key, value)
+        if not ok:
+            return False, message
+    _kde_reload()
+    return True, ""
+
+
+# -- both -----------------------------------------------------------------
+
+def _remember(state: dict) -> None:
     try:
-        stored = PREV_PROXY_MODE.read_text(encoding="utf-8").strip()
-        if stored in ("none", "auto", "manual"):
-            previous = stored
+        mkdir_owned(CACHE_DIR)
+        PREV_PROXY_STATE.write_text(json.dumps(state), encoding="utf-8")
+        chown_back(PREV_PROXY_STATE)
     except OSError:
         pass
-    # Restoring "manual" would leave our dead proxy configured; only auto/none
-    # are safe to hand back.
-    if previous == "manual":
-        previous = "none"
-    return _gsettings(["set", "org.gnome.system.proxy", "mode", previous])
+
+
+def _remembered() -> dict:
+    try:
+        text = PREV_PROXY_STATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    try:
+        state = json.loads(text)
+    except json.JSONDecodeError:
+        # Pre-KDE tuiray wrote the bare gsettings mode into this file.
+        return {"gnome": text} if text in ("none", "auto", "manual") else {}
+    return state if isinstance(state, dict) else {}
+
+
+def set_system_proxy(host: str, socks_port: int, http_port: int) -> tuple:
+    """Point every desktop proxy store at our inbounds; (ok, what was set).
+
+    Failing on one desktop is not a failure: a GNOME box has no kwriteconfig
+    and a Plasma box may have no gsettings schema, and neither is a reason to
+    leave the other one unset.
+    """
+    # A proxy listening on every address is still dialled by loopback.
+    if host in ("0.0.0.0", "::", "*", ""):
+        host = "127.0.0.1"
+    # Remember what the machine had, so stopping restores it instead of
+    # blindly switching everything to "no proxy".
+    kde = is_kde()
+    _remember({"gnome": _gnome_mode(),
+               "kde": _kde_read("ProxyType") if kde else ""})
+
+    applied, problems = [], []
+    ok, message = _gnome_apply(host, socks_port, http_port)
+    if ok:
+        applied.append("GNOME")
+    else:
+        problems.append(f"GNOME: {message}")
+    if kde:
+        ok, message = _kde_apply(host, socks_port, http_port)
+        if ok:
+            applied.append("KDE")
+        else:
+            problems.append(f"KDE: {message}")
+    if applied:
+        return True, ", ".join(applied)
+    return False, "; ".join(problems)
+
+
+def clear_system_proxy() -> tuple:
+    """Put the desktop proxy stores back where they were; (ok, what was reset)."""
+    previous = _remembered()
+
+    # Restoring "manual" would leave our dead proxy configured; only the modes
+    # that route around it are safe to hand back.
+    gnome = previous.get("gnome") or "none"
+    if gnome not in ("none", "auto"):
+        gnome = "none"
+    kde = previous.get("kde") or "0"
+    if kde not in ("0", "2", "3"):              # 0 none, 2 PAC, 3 WPAD; 1 is ours
+        kde = "0"
+
+    applied, problems = [], []
+    ok, message = _gsettings(["set", "org.gnome.system.proxy", "mode", gnome])
+    if ok:
+        applied.append("GNOME")
+    else:
+        problems.append(f"GNOME: {message}")
+    if is_kde():
+        ok, message = _kde_write("ProxyType", kde)
+        if ok:
+            _kde_reload()
+            applied.append("KDE")
+        else:
+            problems.append(f"KDE: {message}")
+    if applied:
+        return True, ", ".join(applied)
+    return False, "; ".join(problems)
 
 
 _PROXY_MODE_CACHE = {"value": "?", "at": 0.0}
 
+KDE_PROXY_TYPE = {"0": "none", "1": "manual", "2": "auto", "3": "auto", "4": "system"}
+
 
 def system_proxy_mode(max_age: float = 3.0) -> str:
-    """Current desktop proxy mode; cached, it is polled by the main screen."""
+    """What the desktop says right now; cached, the main screen polls it."""
     if time.time() - _PROXY_MODE_CACHE["at"] < max_age:
         return _PROXY_MODE_CACHE["value"]
-    ok, value = _gsettings(["get", "org.gnome.system.proxy", "mode"])
-    _PROXY_MODE_CACHE.update(value=value.strip("'") if ok else "?", at=time.time())
+    value = _gnome_mode()
+    if not value and is_kde():
+        value = KDE_PROXY_TYPE.get(_kde_read("ProxyType"), "")
+    _PROXY_MODE_CACHE.update(value=value or "?", at=time.time())
     return _PROXY_MODE_CACHE["value"]

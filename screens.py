@@ -352,9 +352,6 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
              edit.number("proxy.socks_port", "SOCKS5 port:")),
             ("item", "HTTP port", settings.get("proxy.http_port"),
              edit.number("proxy.http_port", "HTTP proxy port:")),
-            ("item", "Set GNOME system proxy while running",
-             "yes" if settings.get("proxy.set_system_proxy") else "no",
-             edit.toggle("proxy.set_system_proxy")),
 
             ("section", "TUN mode", "", None),
             ("item", "Device name", tun.get("name"), edit.text("tun.name", "TUN device name:")),

@@ -69,20 +69,14 @@ class App:
             return f"TUN — system-wide via {tun.get('name', 'tun0')}"
         return "Proxy — local SOCKS + HTTP"
 
-    def access_line(self) -> str:
-        listen = self.settings.get("proxy.listen", "127.0.0.1")
-        socks = self.settings.get("proxy.socks_port")
-        http = self.settings.get("proxy.http_port")
+    def sysproxy_label(self) -> str:
+        if not self.settings.get("proxy.set_system_proxy"):
+            return "off"
         if self.settings.mode == "tun":
-            tun = self.xray.effective_tun()
-            routes = ", ".join(tun.get("routes") or []) or "(none)"
-            via = tun.get("outbound_interface") or "auto"
-            extra = f" · socks5 {listen}:{socks}" if tun.get("keep_socks") else ""
-            return f"{tun.get('name')} · routes {routes} · bypass {via}{extra}"
-        proxy_state = ""
-        if self.settings.get("proxy.set_system_proxy"):
-            proxy_state = f" · GNOME proxy: {runner.system_proxy_mode()}"
-        return f"socks5 {listen}:{socks} · http {listen}:{http}{proxy_state}"
+            return "on · TUN captures everything, not applied"
+        if not self.xray.is_running():
+            return "on · set when xray starts"
+        return f"on · desktop says {runner.system_proxy_mode()}"
 
     def routing_label(self) -> str:
         """One-line summary of the split-routing rules on top of the config."""
@@ -110,6 +104,7 @@ class App:
             {"id": "config", "label": "Config", "value": self.short_config(),
              "note": self.config_summary()},
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
+            {"id": "sysproxy", "label": "System proxy", "value": self.sysproxy_label()},
             {"id": "routing", "label": "Routing", "value": self.routing_label()},
             {"id": "share", "label": "Share", "value": self.share.summary()},
             {"id": "watchdog", "label": "Watchdog", "value": self.watchdog.summary()},
@@ -241,7 +236,7 @@ class App:
         lines = [[("socks5 ", dim), (f"{listen}:{socks}", normal)],
                  [("http   ", dim), (f"{listen}:{http}", normal)]]
         if self.settings.get("proxy.set_system_proxy"):
-            lines.append([("GNOME  ", dim), (runner.system_proxy_mode(), normal)])
+            lines.append([("system ", dim), (runner.system_proxy_mode(), normal)])
         return lines
 
     def traffic_lines(self) -> list:
@@ -524,7 +519,7 @@ class App:
     def pick_mode(self) -> None:
         options = [
             ("Proxy — local SOCKS + HTTP",
-             "apps must be pointed at the proxy (or use the GNOME proxy toggle)"),
+             "apps must be pointed at the proxy (or use the System proxy row)"),
             ("TUN — system-wide",
              "xray creates a TUN device and captures all traffic; needs root/setcap"),
         ]
@@ -556,6 +551,30 @@ class App:
     def open_share(self) -> None:
         screens.share_screen(self.stdscr, self.settings, self.share,
                              self.xray, self.restart)
+
+    def toggle_system_proxy(self) -> None:
+        """Hand the desktop our inbounds, or give it back what it had."""
+        enable = not bool(self.settings.get("proxy.set_system_proxy"))
+        self.settings.set("proxy.set_system_proxy", enable)
+        if self.settings.mode == "tun":
+            self.notify("saved — TUN mode captures everything, "
+                        "so the desktop proxy is left alone", 6)
+            return
+        if not self.xray.is_running():
+            self.notify("system proxy: "
+                        + ("set when xray starts" if enable else "off"))
+            return
+        if enable:
+            ok, detail = runner.set_system_proxy(
+                self.settings.get("proxy.listen", "127.0.0.1"),
+                int(self.settings.get("proxy.socks_port", 10808)),
+                int(self.settings.get("proxy.http_port", 10809)))
+            note = f"set ({detail})" if ok else f"failed ({detail})"
+        else:
+            ok, detail = runner.clear_system_proxy()
+            note = f"restored ({detail})" if ok else f"restore failed ({detail})"
+        self.log.note("system proxy: " + note)
+        self.notify("system proxy: " + note, 6)
 
     def open_watchdog(self) -> None:
         """Toggle the watchdog, force a check, or jump to its settings."""
@@ -630,6 +649,8 @@ class App:
             self.open_share()
         elif item_id == "watchdog":
             self.open_watchdog()
+        elif item_id == "sysproxy":
+            self.toggle_system_proxy()
         elif item_id == "ping":
             self.ping()
         elif item_id == "settings":

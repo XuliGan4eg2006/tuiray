@@ -61,6 +61,7 @@ the bottom of the screen.
 |-----|--------------|
 | **Config** | file browser over `configs/` — the `.json` xray actually runs |
 | **Mode** | Proxy (local SOCKS + HTTP) or TUN (system-wide) |
+| **System proxy** | point the desktop's proxy settings at our inbounds while xray runs (see below) |
 | **Routing** | split-routing rules layered on top of the config (see below) |
 | **Share** | hand the tunnel to other machines over Wi-Fi or ethernet (see below) |
 | **Watchdog** | periodic health check on the tunnel; swaps a dead config for a working one (see below) |
@@ -81,8 +82,8 @@ the process through `~/.cache/tuiray/xray.pid` and keeps showing its log.
 
 **Proxy mode** rewrites the config's inbounds to a SOCKS5 (`10808`) and an HTTP
 (`10809`) listener on `127.0.0.1`. Only apps pointed at the proxy use the tunnel.
-Settings has a *Set GNOME system proxy while running* toggle that flips
-`org.gnome.system.proxy` to those ports on start and restores it on stop.
+The **System proxy** row points the desktop at those ports while xray runs
+(see below).
 
 **TUN mode** uses the TUN inbound of Xray-core (26.x+): xray creates the device,
 assigns the addresses, and installs the captured routes itself — no `tun2socks`.
@@ -130,6 +131,39 @@ Creating the device and editing the routing table needs `CAP_NET_ADMIN`. Either:
 * **sudo** — leave it as is and the TUI asks for your sudo password when starting in
   TUN mode (kept in memory only, for the lifetime of the TUI, so it can also stop
   the root-owned process).
+
+## System proxy
+
+`Enter` on the **System proxy** row hands the desktop our inbounds; it is applied
+when xray starts and undone when it stops, and toggling it while xray is already
+running takes effect immediately. It does nothing in TUN mode, where the device
+captures the traffic anyway.
+
+There is no single "system proxy" on Linux, so — following
+[Throne](https://github.com/throneproj/Throne) and Qv2ray before it — every store
+on the machine is written at once:
+
+| Desktop | What is written |
+|---------|-----------------|
+| GNOME, Cinnamon, MATE, Budgie, Xfce, and every GTK app that asks `GProxyResolver` | `org.gnome.system.proxy` via `gsettings`: `socks` → the SOCKS port, `http` / `https` / `ftp` → the HTTP port, then `mode manual` |
+| KDE Plasma and Trinity | `[Proxy Settings]` in `~/.config/kioslaverc` via `kwriteconfig6`/`kwriteconfig5`: `socksProxy`, `httpProxy`, `httpsProxy`, `ftpProxy`, `ProxyType 1` — then a `org.kde.KIO.Scheduler.reparseSlaveConfiguration` D-Bus signal so running KIO workers re-read it instead of waiting for a logout |
+
+KDE is written only when the session says KDE/Plasma/Trinity, or — when
+`XDG_CURRENT_DESKTOP` was stripped, as `sudo` tends to do — when the KDE tools are
+installed at all. A desktop that fails is not fatal: a GNOME box has no
+`kwriteconfig` and a Plasma box may have no gsettings schema, and neither is a
+reason to leave the other one unset. The log line names what was actually applied
+(`system proxy: set (GNOME, KDE)`).
+
+Where tuiray differs from Throne: **the previous state is remembered** (in
+`~/.cache/tuiray/sysproxy.prev`) and put back on stop, rather than blanket-setting
+"no proxy". The one exception is a previous value of *manual* — restoring that
+would hand the desktop back a proxy that is no longer listening, so `none` is used
+instead.
+
+Started with `sudo` (TUN mode, sharing), the desktop commands are run back as the
+invoking user with their own session bus — root has no dconf or D-Bus session of
+its own, and writing there would configure a desktop nobody is looking at.
 
 ## Traffic counters
 
@@ -386,6 +420,7 @@ leave the screen.
 | `~/.cache/tuiray/xray.log` | xray output, tailed by the log pane |
 | `~/.cache/tuiray/xray.pid` | pid/mode/config of the running instance, for re-attaching |
 | `~/.cache/tuiray/assets/` | symlinks named `geoip.dat` / `geosite.dat`, passed as `XRAY_LOCATION_ASSET` |
+| `~/.cache/tuiray/sysproxy.prev` | the desktop proxy settings from before we touched them |
 | `~/.cache/tuiray/share.json` | what sharing changed on the machine, so it can be undone |
 | `~/.cache/tuiray/share.nft` | the generated nft ruleset, exactly as applied |
 | `~/.cache/tuiray/dnsmasq.{conf,leases,log}` | the DHCP/DNS server for the shared segments |
@@ -400,7 +435,7 @@ main.py       entry point, CLI flags
 app.py        main screen: status, menu, log pane
 screens.py    ping tool and settings screens
 ui.py         curses widgets: frames, popups, file browser
-runner.py     process lifecycle, log tail, traffic stats poller, sudo/setcap, GNOME proxy
+runner.py     process lifecycle, log tail, traffic stats poller, sudo/setcap, system proxy
 pinger.py     SOCKS5 and TCP latency probes, worker pool
 watchdog.py   periodic proxy/internet health checks and the config switch
 share.py      Wi-Fi AP and wired sharing: NM profiles, dnsmasq, nft, teardown

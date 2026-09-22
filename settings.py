@@ -76,7 +76,8 @@ def mkdir_owned(path: Path) -> Path:
     return path
 
 
-CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config") / APP
+CONFIG_HOME = _xdg("XDG_CONFIG_HOME", ".config")    # KDE's kioslaverc lives here
+CONFIG_DIR = CONFIG_HOME / APP
 CACHE_DIR = _xdg("XDG_CACHE_HOME", ".cache") / APP
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
