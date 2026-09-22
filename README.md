@@ -7,27 +7,29 @@ Pure Python 3 + `curses` — no third-party packages.
 
 ```
   TUIray — xray control                                                 dmitry
-┌─ Connection ─────────────────────────────────────────────────────────────────┐
-│ Status        ● running · pid 13837 · up 00:04:11 · mode proxy               │
-│ Access        socks5 127.0.0.1:10808 · http 127.0.0.1:10809                  │
-│                                                                              │
-│ Config        rfn/03_RFN-_Эстония.json    [vless · tcp+xhttp · 3 servers]    │
-│ Mode          Proxy — local SOCKS + HTTP                                     │
-│ GeoIP data    /home/dmitry/subextractor/geoip.dat  (16.9 MB)                 │
-│ GeoSite data  /home/dmitry/subextractor/geosite.dat  (10.0 MB)               │
-│ ──────────────────────────────────────────────────────────────────────────── │
-│ Stop xray                                                                    │
-│ Restart                                                                      │
-│ ──────────────────────────────────────────────────────────────────────────── │
-│ Ping configs…                                                                │
-│ Settings…                                                                    │
-│ Quit                                                                         │
+┌─ Connection ───────────────────────────────────┐┌─ Status ───────────────────┐
+│   Config          savevpn/02_Литва.json  [hys… ││ ● running                  │
+│   Mode            Proxy — local SOCKS + HTTP   ││ pid    12345               │
+│   Routing         LAN/private direct           ││ uptime 00:12:33            │
+│   Share           wifi TUIray · stopped · lan… ││ mode   proxy               │
+│ ▸ Watchdog        watching · proxy 46 ms · di… │└────────────────────────────┘
+│                                                │┌─ Traffic ──────────────────┐
+│ ────────────────────────────────────────────── ││         rate     total     │
+│                                                ││ ↓   1.2 MB/s  472.0 MB     │
+│   Stop xray                                    ││ ↑  43.9 KB/s   12.7 MB     │
+│   Restart                                      │└────────────────────────────┘
+│ ────────────────────────────────────────────── │┌─ Watchdog ─────────────────┐
+│   Ping configs…                                ││ ● ok                in 22s │
+│   Settings…                                    ││ proxy  46 ms               │
+│   Quit                                         ││ direct 61 ms               │
+└────────────────────────────────────────────────┘└────────────────────────────┘
+┌─ Xray log — 4 lines ─────────────────────────────────────────────────────────┐
+│ [tuiray] mode=proxy  config=…/configs/savevpn/02_Литва.json                  │
+│ 2026/09/22 12:10:26 [Warning] core: Xray 26.7.28 started                     │
+│ [tuiray] watchdog enabled                                                    │
+│ [tuiray] watchdog: proxy check failed (timed out) [1/2]                      │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌─ Xray log — 12 lines ────────────────────────────────────────────────────────┐
-│ [tuiray] mode=proxy  config=…/configs/rfn/03_RFN-_Эстония.json               │
-│ 2026/09/04 12:10:26 [Warning] core: Xray 26.7.28 started                     │
-└──────────────── ↓ 1.2 MB/s  ↑ 339.8 KB/s  ·  total ↓ 4.4 GB  ↑ 5.1 MB ───────┘
- Tab pane · Enter activate · s start/stop · R restart · p ping · g settings · q quit
+ Tab pane · Enter activate · s start/stop · R restart · p ping · w share · h w…
 ```
 
 ## Run
@@ -47,7 +49,13 @@ python3 tuiray/main.py --status                                     # is it up?
 python3 tuiray/main.py --stop                                       # stop it
 ```
 
-## Main menu
+## Main screen
+
+The menu is on the left, read-only cards on the right: **Status** (or the
+preflight problems that stop a start), **Traffic**, **Watchdog** and **Access**
+— as many as the terminal has room for, most important first. Below ~78 columns
+the cards collapse into one summary box above the menu, and the log always keeps
+the bottom of the screen.
 
 | Row | What it does |
 |-----|--------------|
@@ -56,10 +64,9 @@ python3 tuiray/main.py --stop                                       # stop it
 | **Routing** | split-routing rules layered on top of the config (see below) |
 | **Share** | hand the tunnel to other machines over Wi-Fi or ethernet (see below) |
 | **Watchdog** | periodic health check on the tunnel; swaps a dead config for a working one (see below) |
-| **GeoIP / GeoSite data** | the `.dat` files; needed when a config uses `geoip:` / `geosite:` rules |
 | **Start / Stop / Restart** | runs `xray run -c …` and follows its log |
 | **Ping configs…** | latency test over every config in the configs directory |
-| **Settings…** | ports, TUN parameters, traffic stats, watchdog, ping options, log level |
+| **Settings…** | paths (xray binary, configs dir, the `geoip.dat` / `geosite.dat` files), ports, TUN parameters, traffic stats, watchdog, ping options, log level |
 
 Keys: `Tab` switch between menu and log · `Enter` activate · `s` start/stop ·
 `R` restart · `p` ping · `w` share · `h` watchdog · `g` settings · `c` clear log ·
@@ -126,16 +133,20 @@ Creating the device and editing the routing table needs `CAP_NET_ADMIN`. Either:
 
 ## Traffic counters
 
-The bottom-right corner of the log frame shows the live rate and the running total
-in both directions:
+The **Traffic** card shows the live rate and the running total in both directions:
 
 ```
-└──────────────── ↓ 1.2 MB/s  ↑ 339.8 KB/s  ·  total ↓ 4.4 GB  ↑ 5.1 MB ───────┘
+┌─ Traffic ──────────────────┐
+│         rate     total     │
+│ ↓   1.2 MB/s  472.0 MB     │
+│ ↑  43.9 KB/s   12.7 MB     │
+└────────────────────────────┘
 ```
 
 Down is what reached your applications, up is what they sent; the totals count from
 the moment xray started (re-attaching to an instance left running keeps its totals).
-On a narrow terminal the totals are dropped and only the rates stay.
+On a terminal too narrow for the card column the rates move into the summary box at
+the top.
 
 The numbers come from xray itself, not from an interface counter, so they are the
 same in proxy and TUN mode. `run.json` gets three extra blocks for it:
@@ -289,18 +300,21 @@ stays in proxy mode, and per-client traffic counters.
 Off by default. Turn it on with `h`, or from the **Watchdog** row (`Enter` →
 *Turn the watchdog on* / *Check now* / *Watchdog settings…*). Every
 `health.interval` seconds it runs two probes and writes what it finds to the log
-pane:
+pane — and it checks a few seconds after you start or stop xray too, rather than
+leaving the **Watchdog** card stale for a whole interval. The card counts down to
+the next check (`checking…` while one is running, `paused` while the ping tool
+has the machine):
 
 | Probe | How | Setting |
 |-------|-----|---------|
 | **proxy** | a request through the running xray — via the local SOCKS inbound, or plain when TUN mode has no inbound to use | *Proxy check URL* |
-| **internet** | the same request made *without* the proxy | *Internet check URL* |
+| **direct** | the same request made *without* the proxy | *Direct check URL* |
 
-The second one exists to place the blame. A dead proxy and a dead uplink look
-identical from inside the tunnel, and cycling through every config in the
+The second one exists to place the blame. A dead proxy and a dead connection
+look identical from inside the tunnel, and cycling through every config in the
 directory because the Wi-Fi dropped is a waste. With *Only switch while the
-uplink is up* on (the default), no uplink means the current config is left
-alone.
+direct link works* on (the default), no connection at all means the current
+config is left alone.
 
 > In TUN mode the device captures everything, so "without the proxy" is a white
 > lie: unless the URL's host is matched by a direct-routing rule, that probe
@@ -339,12 +353,12 @@ leaves everything alone.
 | Watch the connection | off |
 | Check interval | `30` s |
 | Proxy check URL | `http://cp.cloudflare.com/generate_204` |
-| Check the bare uplink too | on |
-| Internet check URL | `http://cp.cloudflare.com/generate_204` |
+| Check the direct connection too | on |
+| Direct check URL | `http://cp.cloudflare.com/generate_204` |
 | Check timeout | `6` s |
 | Failures before acting | `2` |
 | Switch to a working config | on |
-| Only switch while the uplink is up | on |
+| Only switch while the direct link works | on |
 | Cooldown between switches | `60` s |
 | Configs tried per switch | all |
 

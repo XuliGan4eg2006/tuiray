@@ -172,6 +172,16 @@ def _as_list(text: str) -> list:
     return [part.strip() for part in (text or "").split(",") if part.strip()]
 
 
+def asset_value(settings, key: str) -> str:
+    """A .dat path with its size -- or a loud complaint when it is not there."""
+    path = settings.get(key)
+    if not path:
+        return "(not set)"
+    if not Path(path).exists():
+        return f"{path}  — MISSING"
+    return f"{path}  ({ui.human_size(path)})"
+
+
 class _Editors:
     """The popup editors a row list stores as its action.
 
@@ -324,9 +334,9 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
              edit.file("xray_bin", "Select xray binary", None)),
             ("item", "Configs directory", settings.get("configs_dir") or "(not set)",
              edit.dir("configs_dir", "Select configs directory")),
-            ("item", "GeoIP file", settings.get("geoip_path") or "(not set)",
+            ("item", "GeoIP file", asset_value(settings, "geoip_path"),
              edit.file("geoip_path", "Select geoip.dat", (".dat",))),
-            ("item", "GeoSite file", settings.get("geosite_path") or "(not set)",
+            ("item", "GeoSite file", asset_value(settings, "geosite_path"),
              edit.file("geosite_path", "Select geosite.dat", (".dat",))),
             ("item", "Log level", settings.get("loglevel"),
              edit.choice("loglevel", "xray log level",
@@ -469,10 +479,10 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
              edit.number("health.interval", "Seconds between two checks:", float)),
             ("item", "Proxy check URL", settings.get("health.proxy_url"),
              edit.text("health.proxy_url", "URL fetched through the running proxy:")),
-            ("item", "Check the bare uplink too",
+            ("item", "Check the direct connection too",
              "yes" if settings.get("health.check_internet") else "no",
              edit.toggle("health.check_internet")),
-            ("item", "Internet check URL", settings.get("health.internet_url"),
+            ("item", "Direct check URL", settings.get("health.internet_url"),
              edit.text("health.internet_url",
                          "URL fetched without the proxy (in TUN mode the device "
                          "captures this too):")),
@@ -484,7 +494,7 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
             ("item", "Switch to a working config",
              "yes" if settings.get("health.autoswitch") else "no",
              edit.toggle("health.autoswitch")),
-            ("item", "Only switch while the uplink is up",
+            ("item", "Only switch while the direct link works",
              "yes" if settings.get("health.require_internet") else "no",
              edit.toggle("health.require_internet")),
             ("item", "Cooldown between switches (s)", settings.get("health.cooldown"),

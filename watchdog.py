@@ -7,7 +7,7 @@ Two independent probes run on a timer:
     inbound; in a TUN-only setup it is a plain request, which the tunnel
     captures anyway. This is the one that decides whether the config is alive.
   * internet -- the same request made directly, so a dead probe can be blamed
-    on the right thing: no uplink at all is not a bad proxy, and switching
+    on the right thing: no connectivity at all is not a bad proxy, and switching
     configs on a train that went into a tunnel only burns through the list.
     Both URLs are settings (health.proxy_url / health.internet_url).
 
@@ -97,6 +97,8 @@ class Watchdog:
         self._stop = threading.Event()
         self._thread = None
         self._paused = 0
+        self._due = 0.0              # monotonic deadline of the next check
+        self._busy = False           # a check (or a switch) is in flight
         self._live = set()           # probe processes, killed when we shut down
         self._good = {}              # config path -> when it last answered
         self._bad = {}               # config path -> when it last failed
@@ -125,6 +127,27 @@ class Watchdog:
         with self._lock:
             self._state.update(fields)
 
+    def next_check_in(self):
+        """Seconds until the next check, or None when none is scheduled."""
+        if not self.enabled or self._busy or self.paused:
+            return None
+        with self._lock:
+            due = self._due
+        return max(0.0, due - time.monotonic())
+
+    def next_check_label(self) -> str:
+        """The countdown as the UI prints it."""
+        if not self.enabled:
+            return "off"
+        if self._busy:
+            return "checking…"
+        if self.paused:
+            return "paused"
+        seconds = int(self.next_check_in() or 0)
+        if seconds < 60:
+            return f"in {seconds}s"
+        return f"in {seconds // 60}m {seconds % 60:02d}s"
+
     def summary(self) -> str:
         """One line for the main menu."""
         if not self.enabled:
@@ -137,9 +160,9 @@ class Watchdog:
         elif state["proxy_ok"] is False:
             parts.append("proxy down")
         if state["internet_ok"] is False:
-            parts.append("no uplink")
+            parts.append("no direct link")
         elif state["internet_ok"]:
-            parts.append("uplink ok")
+            parts.append("direct ok")
         if state["switches"]:
             parts.append(f"{state['switches']} switch"
                          f"{'es' if state['switches'] > 1 else ''}")
@@ -172,8 +195,21 @@ class Watchdog:
         self.set_enabled(not self.enabled)
         return self.enabled
 
-    def check_now(self) -> None:
+    def check_now(self, delay: float = 0.0) -> None:
+        """Bring the next check forward to `delay` seconds from now."""
+        with self._lock:
+            self._due = time.monotonic() + max(0.0, delay)
         self._wake.set()
+
+    def kicked(self, delay: float = 3.0) -> None:
+        """xray was just started or stopped: check it shortly, from scratch.
+
+        Waiting out a whole interval to find out whether the tunnel a person
+        just started actually works is the wrong answer, and the failures
+        counted against the config that is going away mean nothing now.
+        """
+        self._update(failures=0)
+        self.check_now(delay)
 
     def pause(self) -> None:
         """Hold the checks off -- the ping tool wants the CPU and the ports."""
@@ -229,18 +265,30 @@ class Watchdog:
     # -- loop -------------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
-            interval = max(5.0, float(self.settings.get("health.interval", 30.0)))
             if not self.enabled or self.paused:
                 self._wake.wait(1.0)
                 self._wake.clear()
                 continue
+            # Clear before reading the deadline: a check_now() landing in
+            # between only costs one extra turn round the loop.
+            self._wake.clear()
+            with self._lock:
+                due = self._due
+            waiting = due - time.monotonic()
+            if waiting > 0:
+                self._wake.wait(waiting)
+                continue
+            self._busy = True
             try:
                 self._cycle()
             except Exception as exc:                # a watchdog must never die
                 self.log.note(f"watchdog error: {exc}")
                 self._update(message=str(exc)[:120])
-            self._wake.wait(interval)
-            self._wake.clear()
+            finally:
+                self._busy = False
+            interval = max(5.0, float(self.settings.get("health.interval", 30.0)))
+            with self._lock:
+                self._due = time.monotonic() + interval
 
     def _cycle(self) -> None:
         if not self.xray.is_running():
@@ -279,7 +327,7 @@ class Watchdog:
                 and self.settings.get("health.check_internet", True)
                 and internet_ok is False):
             self._update(state=NO_INTERNET,
-                         message="uplink is down, leaving the config alone")
+                         message="no direct link either, leaving the config alone")
             self.log.note("watchdog: no internet without the proxy either — "
                           "not switching")
             return

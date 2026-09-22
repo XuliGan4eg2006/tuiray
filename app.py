@@ -30,6 +30,8 @@ class App:
         self.log_offset = 0          # lines scrolled up from the tail
         self.summary = None
         self.summary_for = None
+        self._problems = []
+        self._problems_at = 0.0
         self.message = ""
         self.message_until = 0
 
@@ -111,10 +113,6 @@ class App:
             {"id": "routing", "label": "Routing", "value": self.routing_label()},
             {"id": "share", "label": "Share", "value": self.share.summary()},
             {"id": "watchdog", "label": "Watchdog", "value": self.watchdog.summary()},
-            {"id": "geoip", "label": "GeoIP data",
-             "value": self._asset_value("geoip_path")},
-            {"id": "geosite", "label": "GeoSite data",
-             "value": self._asset_value("geosite_path")},
             SEPARATOR,
             {"id": "start", "label": "Stop xray" if running else "Start xray",
              "value": "", "accent": True},
@@ -125,15 +123,24 @@ class App:
             {"id": "quit", "label": "Quit", "value": ""},
         ]
 
-    def _asset_value(self, key: str) -> str:
-        path = self.settings.get(key)
-        if not path:
-            return "(not set)"
-        if not Path(path).exists():
-            return f"{path}  — MISSING"
-        return f"{path}  ({ui.human_size(path)})"
+    def problems(self) -> list:
+        """Cached preflight: the main screen repaints several times a second."""
+        now = time.time()
+        if now - self._problems_at > 2.0:
+            self._problems = self.xray.preflight()
+            self._problems_at = now
+        return self._problems
 
     # -- drawing ----------------------------------------------------------
+    #
+    # Two columns when there is room for them: the menu on the left, a stack of
+    # read-only cards on the right. Below ~78 columns the cards collapse into
+    # one summary card above the menu, and the log keeps the rest.
+
+    SIDEBAR = 30            # width of the card column
+    SPLIT_AT = 78           # narrower than this -> single column
+    MAX_LOG_SHARE = 6       # rows the log keeps when there is room for them
+
     def draw(self) -> None:
         stdscr = self.stdscr
         height, width = stdscr.getmaxyx()
@@ -145,14 +152,31 @@ class App:
         ui.addstr(stdscr, 0, max(0, width - len(right) - 1), right, ui.attr(ui.HEADER))
 
         items = self.menu()
-        body_height = min(len(items) + 6, max(9, height - 9))
-        log_height = max(4, height - 1 - body_height - 1)
-        if body_height + log_height + 2 > height:
-            log_height = max(3, height - body_height - 2)
+        body_top, body_height = 1, max(6, height - 2)
+        split = width >= self.SPLIT_AT
 
-        self._draw_body(1, 0, body_height, width, items)
-        self._draw_log(1 + body_height, 0, log_height, width)
-        self._draw_traffic(body_height + log_height, 0, width)
+        cards = self.cards() if split else []
+        summary_height = 0 if split or body_height < 12 else 5
+        # The band is as tall as the taller column needs; the log keeps a third
+        # of the body, and never more than MAX_LOG_SHARE rows, so a short
+        # terminal spends its rows on the menu rather than on empty log.
+        keep_for_log = min(self.MAX_LOG_SHARE, max(3, body_height // 3))
+        wanted = summary_height + max(len(items) + 2,
+                                      sum(len(lines) + 2 for _, lines in cards))
+        band_height = min(wanted, max(4, body_height - keep_for_log))
+        menu_height = band_height - summary_height
+
+        if split:
+            menu_width = width - self.SIDEBAR
+            self._draw_menu(body_top, 0, menu_height, menu_width, items)
+            self._draw_cards(body_top, menu_width, band_height, self.SIDEBAR, cards)
+        else:
+            if summary_height:
+                self._draw_summary(body_top, 0, summary_height, width)
+            self._draw_menu(body_top + summary_height, 0, menu_height, width, items)
+
+        log_top = body_top + band_height
+        self._draw_log(log_top, 0, max(3, height - 1 - log_top), width)
 
         footer = ("Tab pane · Enter activate · s start/stop · R restart · p ping · "
                   "w share · h watchdog · g settings · c clear log · q quit")
@@ -162,45 +186,200 @@ class App:
         ui.addstr(stdscr, height - 1, 1, ui.clip(footer, width - 2), ui.attr(ui.HEADER))
         stdscr.refresh()
 
-    def _draw_body(self, top: int, left: int, height: int, width: int, items: list) -> None:
+    def _card(self, top: int, left: int, height: int, width: int,
+              title: str, lines: list) -> None:
+        """A framed box holding at most height-2 lines of (text, style) parts."""
+        if height < 2 or width < 4:
+            return
+        ui.draw_frame(self.stdscr, top, left, height, width, title)
+        edge = left + width - 2
+        for offset, line in enumerate(lines[:max(0, height - 2)]):
+            x = left + 2
+            for text, style in line:
+                if x >= edge:
+                    break
+                ui.addstr(self.stdscr, top + 1 + offset, x, ui.clip(text, edge - x), style)
+                x += len(text)
+
+    # -- cards ------------------------------------------------------------
+    def status_lines(self) -> list:
+        running = self.xray.is_running()
+        if running:
+            lines = [[("● ", ui.attr(ui.OK, True)), ("running", ui.attr(ui.OK, True))],
+                     [("pid    ", ui.attr(ui.DIM)), (str(self.xray.pid), ui.attr(ui.NORMAL))],
+                     [("uptime ", ui.attr(ui.DIM)), (self.xray.uptime(), ui.attr(ui.NORMAL))],
+                     [("mode   ", ui.attr(ui.DIM)),
+                      (self.xray.running_mode(), ui.attr(ui.NORMAL))]]
+            config = self.xray.running_config()
+            if config and config != self.settings.config_path:
+                lines.append([("config changed — restart", ui.attr(ui.WARN))])
+            return lines
+
+        lines = [[("○ ", ui.attr(ui.ERROR, True)), ("stopped", ui.attr(ui.ERROR, True))]]
+        problems = self.problems()
+        if problems:
+            lines += [[(problem, ui.attr(ui.ERROR))] for problem in problems[:3]]
+        else:
+            lines.append([("ready — press s to start", ui.attr(ui.DIM))])
+        return lines
+
+    def access_lines(self) -> list:
+        listen = self.settings.get("proxy.listen", "127.0.0.1")
+        socks = self.settings.get("proxy.socks_port")
+        http = self.settings.get("proxy.http_port")
+        dim, normal = ui.attr(ui.DIM), ui.attr(ui.NORMAL)
+        if self.settings.mode == "tun":
+            tun = self.xray.effective_tun()
+            lines = [[("device ", dim), (str(tun.get("name")), normal)],
+                     [("routes ", dim),
+                      (", ".join(tun.get("routes") or []) or "(none)", normal)],
+                     [("bypass ", dim), (tun.get("outbound_interface") or "auto", normal)]]
+            if tun.get("keep_socks"):
+                lines.append([("socks5 ", dim), (f"{listen}:{socks}", normal)])
+            return lines
+
+        lines = [[("socks5 ", dim), (f"{listen}:{socks}", normal)],
+                 [("http   ", dim), (f"{listen}:{http}", normal)]]
+        if self.settings.get("proxy.set_system_proxy"):
+            lines.append([("GNOME  ", dim), (runner.system_proxy_mode(), normal)])
+        return lines
+
+    def traffic_lines(self) -> list:
+        stats = self.xray.stats.snapshot()
+        dim = ui.attr(ui.DIM)
+        if not stats["ok"]:
+            if not self.settings.get("stats.enabled", True):
+                return [[("counters are off", dim)]]
+            if not self.xray.is_running():
+                return [[("idle", dim)]]
+            return [[("waiting for the xray API", dim)]]
+        return [
+            [(f"{'rate':>12}{'total':>10}", dim)],
+            [("↓ ", ui.attr(ui.OK, True)),
+             (f"{ui.human_rate(stats['down_rate']):>10}", ui.attr(ui.OK)),
+             (f"{ui.human_bytes(stats['downlink']):>10}", ui.attr(ui.DIM))],
+            [("↑ ", ui.attr(ui.WARN, True)),
+             (f"{ui.human_rate(stats['up_rate']):>10}", ui.attr(ui.WARN)),
+             (f"{ui.human_bytes(stats['uplink']):>10}", ui.attr(ui.DIM))],
+        ]
+
+    def watchdog_lines(self) -> list:
+        dim = ui.attr(ui.DIM)
+        if not self.watchdog.enabled:
+            return [[("○ ", dim), ("off", dim)],
+                    [("press h to watch the tunnel", dim)]]
+        state = self.watchdog.snapshot()
+        style = {watchdog.OK: ui.attr(ui.OK, True),
+                 watchdog.IDLE: ui.attr(ui.DIM)}.get(state["state"], ui.attr(ui.WARN, True))
+        marker = "●" if state["state"] == watchdog.OK else "◐"
+        # The countdown rides on the state line, right-aligned: a row of its own
+        # would be the first thing a short card drops.
+        head = f"{marker} {state['state']}"
+        timer = self.watchdog.next_check_label()
+        pad = max(1, self.SIDEBAR - 4 - len(head) - len(timer))
+        lines = [[(head, style), (" " * pad, dim), (timer, dim)]]
+        for label, ok, ms in (("proxy ", state["proxy_ok"], state["proxy_ms"]),
+                              ("direct", state["internet_ok"], state["internet_ms"])):
+            if ok is None:
+                value, value_style = "—", dim
+            elif ok:
+                value, value_style = f"{ms:.0f} ms", ui.attr(ui.OK)
+            else:
+                value, value_style = "down", ui.attr(ui.ERROR)
+            lines.append([(f"{label} ", dim), (value, value_style)])
+        if state["message"]:
+            lines.append([(state["message"], dim)])
+        return lines
+
+    def cards(self) -> list:
+        """The card column, most important first -- the tail is dropped first."""
+        return [("Status", self.status_lines()),
+                ("Traffic", self.traffic_lines()),
+                ("Watchdog", self.watchdog_lines()),
+                ("Access", self.access_lines())]
+
+    def _draw_cards(self, top: int, left: int, height: int, width: int,
+                    cards: list) -> None:
+        """Stack the cards that fit; leftover rows pad them from the bottom up."""
+        placed, remaining = [], height
+        for title, lines in cards:
+            wanted = len(lines) + 2
+            if remaining >= wanted:
+                placed.append([title, lines, wanted])
+                remaining -= wanted
+            elif remaining >= 4:                 # room for a clipped card
+                placed.append([title, lines, remaining])
+                remaining = 0
+            if not remaining:
+                break
+        # Bottoms have to line up with the menu box, so spread the slack instead
+        # of leaving one stretched card with a hole in it.
+        position = len(placed) - 1
+        while remaining > 0 and placed:
+            placed[position][2] += 1
+            remaining -= 1
+            position = (position - 1) % len(placed)
+
+        row = top
+        for title, lines, card_height in placed:
+            self._card(row, left, card_height, width, title, lines)
+            row += card_height
+
+    def _draw_summary(self, top: int, left: int, height: int, width: int) -> None:
+        """The narrow-terminal stand-in for the card column: one dense box."""
+        dim = ui.attr(ui.DIM)
+        status = self.status_lines()[0]
+        if self.xray.is_running():
+            status = status + [(f"  pid {self.xray.pid} · up {self.xray.uptime()} · "
+                                f"{self.xray.running_mode()}", dim)]
+        access = [part for line in self.access_lines()[:2] for part in line + [("  ", dim)]]
+
+        stats = self.xray.stats.snapshot()
+        live = []
+        if stats["ok"]:
+            live = [("↓ ", ui.attr(ui.OK, True)),
+                    (ui.human_rate(stats["down_rate"]), ui.attr(ui.OK)),
+                    ("  ↑ ", ui.attr(ui.WARN, True)),
+                    (ui.human_rate(stats["up_rate"]), ui.attr(ui.WARN)),
+                    ("  ", dim)]
+        # The Watchdog row of the menu carries its state here, so the card only
+        # adds what that row has no room for: when the next check lands.
+        if self.watchdog.enabled:
+            live.append((f"watchdog next {self.watchdog.next_check_label()}", dim))
+        else:
+            live.append(("watchdog off", dim))
+        self._card(top, left, height, width, "Status", [status, access, live])
+
+    # -- menu -------------------------------------------------------------
+    def _draw_menu(self, top: int, left: int, height: int, width: int, items: list) -> None:
         stdscr = self.stdscr
         ui.draw_frame(stdscr, top, left, height, width, "Connection",
                       focused=self.focus == "menu")
 
-        running = self.xray.is_running()
-        marker, state_style = ("●", ui.OK) if running else ("○", ui.ERROR)
-        state = "running" if running else "stopped"
-        details = ""
-        if running:
-            details = (f"· pid {self.xray.pid} · up {self.xray.uptime()} · "
-                       f"mode {self.xray.running_mode()}")
-            config = self.xray.running_config()
-            if config and config != self.settings.config_path:
-                details += " · config changed, restart to apply"
-        ui.addstr(stdscr, top + 1, left + 2, "Status", ui.attr(ui.DIM))
-        ui.addstr(stdscr, top + 1, left + 16, f"{marker} {state}", ui.attr(state_style, True))
-        ui.addstr(stdscr, top + 1, left + 16 + len(state) + 3, details, ui.attr(ui.DIM))
-        ui.addstr(stdscr, top + 2, left + 2, "Access", ui.attr(ui.DIM))
-        ui.addstr(stdscr, top + 2, left + 16, ui.clip(self.access_line(), width - 19))
-
-        # On a short terminal the menu scrolls so the cursor stays visible.
-        capacity = max(1, height - 5)
+        self.index = max(0, min(self.index, len(items) - 1))
+        capacity = max(1, height - 2)
         if len(items) > capacity:
             if self.index < self.menu_top:
                 self.menu_top = self.index
             elif self.index >= self.menu_top + capacity:
                 self.menu_top = self.index - capacity + 1
             self.menu_top = max(0, min(self.menu_top, len(items) - capacity))
+            rows_to_draw = list(enumerate(items))
         else:
             self.menu_top = 0
+            rows_to_draw = self._spaced(items, capacity - len(items))
 
-        row = top + 4
+        row = top + 1
         limit = top + height - 1
-        for position, item in enumerate(items):
+        label_width = 14
+        for position, item in rows_to_draw:
             if position < self.menu_top:
                 continue
             if row >= limit:
                 break
+            if item is None:                     # breathing room around a rule
+                row += 1
+                continue
             if item["id"] == "sep":
                 ui.addstr(stdscr, row, left + 2, "─" * (width - 4), ui.attr(ui.DIM))
                 row += 1
@@ -209,16 +388,35 @@ class App:
             style = ui.attr(ui.SELECT) if selected else ui.attr(
                 ui.KEYHINT if item.get("accent") else ui.NORMAL)
             ui.fill_line(stdscr, row, left + 1, width - 2, style)
-            ui.addstr(stdscr, row, left + 2, ui.clip(item["label"], 14), style)
-            value_x = left + 16
+            ui.addstr(stdscr, row, left + 2, "▸" if selected else " ", style)
+            ui.addstr(stdscr, row, left + 4, ui.clip(item["label"], label_width), style)
+            value_x = left + 4 + label_width + 2
             ui.addstr(stdscr, row, value_x, ui.clip(item.get("value", ""),
-                                                    width - value_x - 3), style)
+                                                    width - value_x + left - 2), style)
             note = item.get("note")
             if note and not selected:
                 start = value_x + len(item.get("value", "")) + 2
-                ui.addstr(stdscr, row, start, ui.clip(f"[{note}]", width - start - 3),
-                          ui.attr(ui.DIM))
+                ui.addstr(stdscr, row, start,
+                          ui.clip(f"[{note}]", left + width - 2 - start), ui.attr(ui.DIM))
             row += 1
+
+    @staticmethod
+    def _spaced(items: list, slack: int) -> list:
+        """(index, item) rows, with blank ones spent on the group separators.
+
+        A menu box stretched to the height of the card column would otherwise
+        end in a hole; spacing the groups out makes the room look deliberate.
+        """
+        rows = []
+        for position, item in enumerate(items):
+            if item["id"] == "sep" and slack > 0:
+                rows.append((position, None))
+                slack -= 1
+            rows.append((position, item))
+            if item["id"] == "sep" and slack > 0:
+                rows.append((position, None))
+                slack -= 1
+        return rows
 
     def _draw_log(self, top: int, left: int, height: int, width: int) -> None:
         stdscr = self.stdscr
@@ -247,39 +445,6 @@ class App:
                 style = ui.attr(ui.OK)
             ui.addstr(stdscr, top + 1 + offset, left + 2, ui.clip(line, width - 4), style)
 
-    def _draw_traffic(self, row: int, left: int, width: int) -> None:
-        """Live rates and session totals, inlaid in the bottom-right border."""
-        stats = self.xray.stats.snapshot()
-        if not stats["ok"]:
-            if not self.xray.is_running() or not self.settings.get("stats.enabled", True):
-                return
-            segments = [("traffic: waiting for the xray API", ui.attr(ui.DIM))]
-        else:
-            segments = [
-                ("↓ ", ui.attr(ui.DIM)),
-                (ui.human_rate(stats["down_rate"]), ui.attr(ui.OK, True)),
-                ("  ↑ ", ui.attr(ui.DIM)),
-                (ui.human_rate(stats["up_rate"]), ui.attr(ui.WARN, True)),
-            ]
-            totals = [
-                ("  ·  total ↓ ", ui.attr(ui.DIM)),
-                (ui.human_bytes(stats["downlink"]), ui.attr(ui.OK)),
-                ("  ↑ ", ui.attr(ui.DIM)),
-                (ui.human_bytes(stats["uplink"]), ui.attr(ui.WARN)),
-            ]
-            # Totals are the first thing to go on a narrow terminal.
-            if sum(len(text) for text, _ in segments + totals) + 8 <= width:
-                segments += totals
-
-        span = sum(len(text) for text, _ in segments)
-        x = left + width - 2 - span
-        if x < left + 3:
-            return
-        ui.addstr(self.stdscr, row, x - 1, " ", ui.attr(ui.DIM))
-        for text, style in segments:
-            ui.addstr(self.stdscr, row, x, text, style)
-            x += len(text)
-        ui.addstr(self.stdscr, row, x, " ", ui.attr(ui.DIM))
 
     # -- actions ----------------------------------------------------------
     def start(self) -> None:
@@ -308,6 +473,9 @@ class App:
             self.notify("xray exited immediately — see the log below", 8)
         else:
             self.notify(f"xray started in {self.settings.mode} mode")
+            # Don't make the watchdog sit out a whole interval before saying
+            # whether what was just started actually carries traffic.
+            self.watchdog.kicked()
         self.log_offset = 0
 
     def stop(self) -> None:
@@ -324,6 +492,7 @@ class App:
                                  "Stop it manually with:  sudo pkill -f 'xray run -c'",
                                  ui.ERROR)
                 return
+        self.watchdog.kicked(0.5)
         self.notify("xray stopped")
 
     def toggle(self) -> None:
@@ -370,14 +539,6 @@ class App:
         if mode == "tun" and self.xray.needs_root():
             self.notify("TUN mode will ask for your sudo password on start", 6)
         self.maybe_restart("Mode changed.")
-
-    def pick_asset(self, key: str, title: str) -> None:
-        start = self.settings.get(key) or self.settings.get("configs_dir")
-        path = ui.file_browser(self.stdscr, start, title, extensions=(".dat",))
-        if path:
-            self.settings.set(key, path)
-            self.settings.asset_dir()
-            self.maybe_restart(f"{title} changed.")
 
     def maybe_restart(self, reason: str) -> None:
         if self.xray.is_running() and ui.popup_confirm(
@@ -459,10 +620,6 @@ class App:
             self.pick_config()
         elif item_id == "mode":
             self.pick_mode()
-        elif item_id == "geoip":
-            self.pick_asset("geoip_path", "Select geoip.dat")
-        elif item_id == "geosite":
-            self.pick_asset("geosite_path", "Select geosite.dat")
         elif item_id == "start":
             self.toggle()
         elif item_id == "restart":
