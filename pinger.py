@@ -95,15 +95,15 @@ def _recv_exact(sock, count: int) -> bytes:
     return buffer
 
 
-def socks5_request(port: int, url: str, timeout: float) -> float:
-    """Time one request to `url` through a local SOCKS5 proxy, in ms."""
+def socks5_request(port: int, url: str, timeout: float, proxy_host: str = "127.0.0.1") -> float:
+    """Time one request to `url` through a SOCKS5 proxy, in ms."""
     parts = urlsplit(url)
     host = parts.hostname or "cp.cloudflare.com"
     target_port = parts.port or (443 if parts.scheme == "https" else 80)
     path = parts.path or "/"
 
     started = time.perf_counter()
-    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    sock = socket.create_connection((proxy_host, port), timeout=timeout)
     try:
         sock.settimeout(timeout)
         sock.sendall(b"\x05\x01\x00")
@@ -162,8 +162,13 @@ def _wait_for_port(port: int, process, deadline: float) -> bool:
     return False
 
 
-def probe_proxy(path: Path, settings, timeout: float, attempts: int, on_spawn=None) -> tuple:
-    """(ms, detail) through a private xray instance; raises on failure."""
+def probe_proxy(path: Path, settings, timeout: float, attempts: int, on_spawn=None,
+                url: str = None) -> tuple:
+    """(ms, detail) through a private xray instance; raises on failure.
+
+    `url` overrides the ping tool's test URL -- the watchdog probes candidate
+    configs with its own.
+    """
     config = xrayconf.load(path)
     port = free_port()
     mkdir_owned(PING_DIR)
@@ -186,11 +191,11 @@ def probe_proxy(path: Path, settings, timeout: float, attempts: int, on_spawn=No
             tail = _tail(log_file)
             raise OSError(tail or "xray did not start")
 
-        url = settings.get("ping.url")
+        target = url or settings.get("ping.url")
         best, last_error = None, None
         for _ in range(max(1, attempts)):
             try:
-                value = socks5_request(port, url, timeout)
+                value = socks5_request(port, target, timeout)
                 best = value if best is None else min(best, value)
             except (OSError, ssl.SSLError) as exc:
                 last_error = exc

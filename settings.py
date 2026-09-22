@@ -166,6 +166,20 @@ DEFAULTS = {
             "static": [],
         },
     },
+    "health": {
+        # Watchdog: poll the tunnel, and switch to another config when it dies.
+        "enabled": False,
+        "interval": 30.0,       # seconds between two checks
+        "timeout": 6.0,         # per-request timeout
+        "proxy_url": "http://cp.cloudflare.com/generate_204",     # fetched through xray
+        "internet_url": "http://cp.cloudflare.com/generate_204",  # fetched directly
+        "check_internet": True,   # also probe the bare uplink
+        "failures": 2,          # consecutive failed checks before acting
+        "autoswitch": True,     # dead proxy -> find a working config and restart
+        "require_internet": True,   # never switch while the uplink itself is down
+        "cooldown": 60.0,       # seconds to wait before switching again
+        "candidates": 0,        # configs tried per switch; 0 -> all of them
+    },
     "ping": {
         "mode": "proxy",        # "proxy" (real latency through xray) | "tcp" (endpoint handshake)
         "url": "http://cp.cloudflare.com/generate_204",

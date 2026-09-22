@@ -330,6 +330,9 @@ class XrayRunner:
         self._tail_stop = None
         self._tail_thread = None
         self.stats = TrafficStats(settings)
+        # The watchdog restarts xray from its own thread while the UI may be
+        # doing the same; one lifecycle at a time.
+        self.lifecycle = threading.RLock()
 
     # -- state ------------------------------------------------------------
     @property
@@ -433,6 +436,10 @@ class XrayRunner:
         return path
 
     def start(self, password: str = None) -> None:
+        with self.lifecycle:
+            self._start(password)
+
+    def _start(self, password: str = None) -> None:
         if self.is_running():
             return
         password = password or cached_password()
@@ -525,6 +532,10 @@ class XrayRunner:
 
     def stop(self, timeout: float = 6.0, password: str = None) -> bool:
         """Stop the instance. False means it is still running (sudo refused)."""
+        with self.lifecycle:
+            return self._stop(timeout, password)
+
+    def _stop(self, timeout: float = 6.0, password: str = None) -> bool:
         if not self.is_running():
             self._cleanup_after_stop()
             return True

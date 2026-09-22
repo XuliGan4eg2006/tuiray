@@ -55,13 +55,15 @@ python3 tuiray/main.py --stop                                       # stop it
 | **Mode** | Proxy (local SOCKS + HTTP) or TUN (system-wide) |
 | **Routing** | split-routing rules layered on top of the config (see below) |
 | **Share** | hand the tunnel to other machines over Wi-Fi or ethernet (see below) |
+| **Watchdog** | periodic health check on the tunnel; swaps a dead config for a working one (see below) |
 | **GeoIP / GeoSite data** | the `.dat` files; needed when a config uses `geoip:` / `geosite:` rules |
 | **Start / Stop / Restart** | runs `xray run -c …` and follows its log |
 | **Ping configs…** | latency test over every config in the configs directory |
-| **Settings…** | ports, TUN parameters, traffic stats, ping options, log level |
+| **Settings…** | ports, TUN parameters, traffic stats, watchdog, ping options, log level |
 
 Keys: `Tab` switch between menu and log · `Enter` activate · `s` start/stop ·
-`R` restart · `p` ping · `w` share · `g` settings · `c` clear log · `q` quit.
+`R` restart · `p` ping · `w` share · `h` watchdog · `g` settings · `c` clear log ·
+`q` quit.
 With the log pane focused, `↑ ↓ PgUp PgDn Home End` scroll it; `End` returns to
 following the tail.
 
@@ -282,6 +284,70 @@ AP and client mode on the *same* card at once (it needs a second virtual interfa
 plus hostapd, and one shared channel), transparent proxying for guests while the host
 stays in proxy mode, and per-client traffic counters.
 
+## Watchdog
+
+Off by default. Turn it on with `h`, or from the **Watchdog** row (`Enter` →
+*Turn the watchdog on* / *Check now* / *Watchdog settings…*). Every
+`health.interval` seconds it runs two probes and writes what it finds to the log
+pane:
+
+| Probe | How | Setting |
+|-------|-----|---------|
+| **proxy** | a request through the running xray — via the local SOCKS inbound, or plain when TUN mode has no inbound to use | *Proxy check URL* |
+| **internet** | the same request made *without* the proxy | *Internet check URL* |
+
+The second one exists to place the blame. A dead proxy and a dead uplink look
+identical from inside the tunnel, and cycling through every config in the
+directory because the Wi-Fi dropped is a waste. With *Only switch while the
+uplink is up* on (the default), no uplink means the current config is left
+alone.
+
+> In TUN mode the device captures everything, so "without the proxy" is a white
+> lie: unless the URL's host is matched by a direct-routing rule, that probe
+> travels through the tunnel too and will simply agree with the first one.
+
+After *Failures before acting* consecutive failed proxy checks (default 2) the
+switch begins:
+
+1. Candidates are the other `*.json` under the configs directory, ordered best
+   bet first — ones that answered before, then untried ones, then the ones that
+   failed most recently.
+2. Each is probed in its own throwaway xray on a free port, exactly as the ping
+   tool does. *Configs tried per switch* caps how many (`0` = all of them).
+3. The first one that answers becomes the selected config and xray is
+   restarted on it. If it starts but still does not answer within a few
+   seconds, it is marked bad and the next candidate is tried.
+4. If none answers, the original config is put back and the state reads
+   *no working config*.
+
+In **TUN mode** the tunnel is taken down before the candidates are probed:
+the device would otherwise swallow the probes' own traffic and measure every
+candidate through the tunnel that just died. It comes back up on the winner, or
+on the original config when nothing works.
+
+*Cooldown between switches* (default 60 s) keeps a flapping link from walking
+through the whole directory in a minute. The ping tool suspends the watchdog
+while it is open — both want a private xray and a port.
+
+TUN mode needs root to restart xray. The watchdog will not take a working
+tunnel down unless sudo can be used unattended (a credential cached by an
+earlier start, or a passwordless sudo); otherwise it reports the problem and
+leaves everything alone.
+
+| Setting | Default |
+|---------|---------|
+| Watch the connection | off |
+| Check interval | `30` s |
+| Proxy check URL | `http://cp.cloudflare.com/generate_204` |
+| Check the bare uplink too | on |
+| Internet check URL | `http://cp.cloudflare.com/generate_204` |
+| Check timeout | `6` s |
+| Failures before acting | `2` |
+| Switch to a working config | on |
+| Only switch while the uplink is up | on |
+| Cooldown between switches | `60` s |
+| Configs tried per switch | all |
+
 ## Ping tool
 
 `p` from the main menu tests every `*.json` under the configs directory and sorts by
@@ -322,6 +388,7 @@ screens.py    ping tool and settings screens
 ui.py         curses widgets: frames, popups, file browser
 runner.py     process lifecycle, log tail, traffic stats poller, sudo/setcap, GNOME proxy
 pinger.py     SOCKS5 and TCP latency probes, worker pool
+watchdog.py   periodic proxy/internet health checks and the config switch
 share.py      Wi-Fi AP and wired sharing: NM profiles, dnsmasq, nft, teardown
 xrayconf.py   config loading, inbound rewriting for proxy/TUN, stats API block
 settings.py   persisted settings

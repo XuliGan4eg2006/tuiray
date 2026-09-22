@@ -10,6 +10,7 @@ import runner
 import screens
 import share
 import ui
+import watchdog
 import xrayconf
 
 SEPARATOR = {"id": "sep"}
@@ -22,6 +23,7 @@ class App:
         self.log = runner.LogBuffer(int(settings.get("log_lines", 3000)))
         self.xray = runner.XrayRunner(settings, self.log)
         self.share = share.ShareManager(settings, self.log)
+        self.watchdog = watchdog.Watchdog(settings, self.xray, self.log)
         self.focus = "menu"          # menu | log
         self.index = 0
         self.menu_top = 0            # first menu row drawn, for short terminals
@@ -108,6 +110,7 @@ class App:
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
             {"id": "routing", "label": "Routing", "value": self.routing_label()},
             {"id": "share", "label": "Share", "value": self.share.summary()},
+            {"id": "watchdog", "label": "Watchdog", "value": self.watchdog.summary()},
             {"id": "geoip", "label": "GeoIP data",
              "value": self._asset_value("geoip_path")},
             {"id": "geosite", "label": "GeoSite data",
@@ -152,7 +155,7 @@ class App:
         self._draw_traffic(body_height + log_height, 0, width)
 
         footer = ("Tab pane · Enter activate · s start/stop · R restart · p ping · "
-                  "w share · g settings · c clear log · q quit")
+                  "w share · h watchdog · g settings · c clear log · q quit")
         if self.message and time.time() < self.message_until:
             footer = self.message
         ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
@@ -393,8 +396,36 @@ class App:
         screens.share_screen(self.stdscr, self.settings, self.share,
                              self.xray, self.restart)
 
+    def open_watchdog(self) -> None:
+        """Toggle the watchdog, force a check, or jump to its settings."""
+        state = self.watchdog.snapshot()
+        on = self.watchdog.enabled
+        detail = state["message"] or "-"
+        picked = ui.popup_list(
+            self.stdscr, "Connection watchdog",
+            [("Turn the watchdog off" if on else "Turn the watchdog on",
+              "checks the proxy every "
+              f"{self.settings.get('health.interval')}s and switches config when it dies"),
+             ("Check now", detail),
+             ("Watchdog settings…", "URLs, interval, auto-switch")], 0)
+        if picked == 0:
+            self.notify("watchdog " + ("enabled" if self.watchdog.toggle() else "disabled"))
+        elif picked == 1:
+            if not self.watchdog.enabled:
+                self.notify("watchdog is off — turn it on first", 5)
+                return
+            self.watchdog.check_now()
+            self.notify("watchdog: checking…")
+        elif picked == 2:
+            self.open_settings("Connection watchdog")
+
     def ping(self) -> None:
-        chosen = screens.ping_screen(self.stdscr, self.settings)
+        # One xray per probe and a port each: the watchdog stays out of the way.
+        self.watchdog.pause()
+        try:
+            chosen = screens.ping_screen(self.stdscr, self.settings)
+        finally:
+            self.watchdog.resume()
         if chosen:
             self.use_config(chosen)
 
@@ -440,6 +471,8 @@ class App:
             self.open_settings("Split routing")
         elif item_id == "share":
             self.open_share()
+        elif item_id == "watchdog":
+            self.open_watchdog()
         elif item_id == "ping":
             self.ping()
         elif item_id == "settings":
@@ -460,7 +493,13 @@ class App:
 
     def run(self) -> None:
         self.xray.adopt()
+        self.watchdog.start()
+        try:
+            self._loop()
+        finally:
+            self.watchdog.stop()
 
+    def _loop(self) -> None:
         while True:
             # Sub-screens set their own input timeout; restore ours each pass so
             # the status line and log keep refreshing without a keypress.
@@ -490,6 +529,9 @@ class App:
                 continue
             if key in ("w", "W"):
                 self.open_share()
+                continue
+            if key in ("h", "H"):
+                self.notify("watchdog " + ("enabled" if self.watchdog.toggle() else "disabled"))
                 continue
             if key in ("g", "G"):
                 self.open_settings()
