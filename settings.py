@@ -167,6 +167,16 @@ DEFAULTS = {
             "static": [],
         },
     },
+    # Config sources the user added: {"type": "file"|"links", "name": ..., and
+    # "path" or "links"}. Subscriptions are not here -- they live in the
+    # submodule's profiles.json, which the command-line converter shares.
+    "sources": [],
+    "subs": {
+        # Subscription profiles, handled by the Happ-converter submodule.
+        "profiles_file": "",    # "" -> tuiray/Happ-converter/profiles.json
+        "timeout": 30.0,
+        "hwid": "",             # X-Hwid for new profiles; made on first use
+    },
     "health": {
         # Watchdog: poll the tunnel, and switch to another config when it dies.
         "enabled": False,

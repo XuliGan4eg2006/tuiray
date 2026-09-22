@@ -269,6 +269,78 @@ def popup_input(stdscr, title: str, prompt: str, value: str = "",
     return text
 
 
+def popup_paste(stdscr, title: str, prompt: str, counter=None, initial: str = "") -> str:
+    """Multi-line box for pasted text. Returns the text, or None when cancelled.
+
+    A terminal paste arrives as ordinary keystrokes, newlines included, so the
+    only thing needed to accept forty share links at once is an Enter that adds
+    a line instead of submitting. Ctrl-D (or F2) finishes.
+
+    `counter(text)` may return a one-line summary shown while typing -- the
+    links screen uses it to say how many links it can see so far.
+    """
+    width = min(curses.COLS - 4, max(56, curses.COLS - 10))
+    height = min(curses.LINES - 2, 18)
+    window = center_window(height, width)
+    window.timeout(-1)
+    lines = str(initial).split("\n") if initial else [""]
+    field_width = width - 4
+    rows = height - 6
+    # The summary is recomputed per line, not per keystroke: a pasted
+    # subscription is thousands of keystrokes, and re-parsing all of it on each
+    # one would turn the paste into a crawl.
+    summary, summarised = "", -1
+
+    curses.curs_set(1)
+    while True:
+        window.erase()
+        draw_frame(window, 0, 0, height, width, title, focused=True)
+        addstr(window, 1, 2, clip(prompt, field_width), attr(DIM))
+
+        top = max(0, len(lines) - rows)
+        for offset, line in enumerate(lines[top: top + rows]):
+            shown = line[-(field_width - 1):] if len(line) >= field_width else line
+            addstr(window, 3 + offset, 2, shown, attr(NORMAL))
+
+        if len(lines) != summarised:
+            summarised = len(lines)
+            summary = (counter("\n".join(lines)) if counter
+                       else f"{summarised} line{'s' if summarised > 1 else ''}")
+        addstr(window, height - 3, 2, clip(summary, field_width), attr(OK))
+        addstr(window, height - 2, 2, "Ctrl-D done · Esc cancel", attr(KEYHINT))
+        cursor_row = 3 + min(len(lines) - 1 - top, rows - 1)
+        try:
+            window.move(cursor_row, 2 + min(len(lines[-1]), field_width - 1))
+        except curses.error:
+            pass
+        window.refresh()
+
+        key = getkey(window)
+        if key is None:
+            continue
+        if key in ("\x04", curses.KEY_F2):        # Ctrl-D
+            break
+        if is_escape(key):
+            lines = None
+            break
+        if is_enter(key):
+            lines.append("")
+        elif key in (curses.KEY_BACKSPACE, "\b", "\x7f", 127):
+            if lines[-1]:
+                lines[-1] = lines[-1][:-1]
+            elif len(lines) > 1:
+                lines.pop()
+        elif key == "\x15":                       # Ctrl-U drops the current line
+            lines[-1] = ""
+        elif isinstance(key, str) and key.isprintable():
+            lines[-1] += key
+
+    curses.curs_set(0)
+    stdscr.touchwin()
+    stdscr.refresh()
+    return None if lines is None else "\n".join(lines).strip()
+
+
 def popup_list(stdscr, title: str, items: list, current: int = 0,
                hint: str = "↑/↓ move · Enter select · Esc cancel") -> int:
     """Pick one of `items` (list of str or (label, description)). None = cancel."""
@@ -342,7 +414,8 @@ def file_browser(stdscr, start: str, title: str = "Select file",
     """Browse the filesystem; returns a path or None.
 
     `extensions` filters the files shown (None = show everything);
-    `pick_dir` returns a directory instead of a file.
+    `pick_dir` adds "d" for taking the directory itself, with files still
+    listed and selectable -- a source can be either.
     """
     current = Path(start or Path.cwd()).expanduser()
     if current.is_file():
@@ -370,7 +443,7 @@ def file_browser(stdscr, start: str, title: str = "Select file",
                 continue
             if child.is_dir():
                 items.append((child.name + "/", child, True))
-            elif not pick_dir:
+            else:
                 if extensions and child.suffix.lower() not in extensions:
                     continue
                 items.append((child.name, child, False))
@@ -407,7 +480,7 @@ def file_browser(stdscr, start: str, title: str = "Select file",
             if suffix:
                 addstr(window, 2 + offset, width - len(suffix) - 3, suffix, style)
 
-        hint = ("Enter open · d use this dir · " if pick_dir else "Enter select · ")
+        hint = ("Enter select · d use this dir · " if pick_dir else "Enter select · ")
         hint += "h up · / filter · . hidden · ~ home · Esc cancel"
         if filter_text:
             hint = f"filter: {filter_text}  (Esc clears)"

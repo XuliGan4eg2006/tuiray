@@ -5,11 +5,14 @@ import json
 import os
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import links
 import pinger
 import runner
 import share
 import ui
+import subs
 import xrayconf
 import xrayget
 
@@ -28,9 +31,44 @@ DHCP_LABEL = {
 }
 
 
+ALL_GROUPS = "all groups"
+
+
+def _config_groups(paths: list, root: Path) -> dict:
+    """{group name: [config paths]} -- one group per folder under the root.
+
+    A subscription exports into its own folder, so the folder is the natural
+    unit: "test the configs of the profile I am on" rather than every config
+    on the machine.
+    """
+    groups = {}
+    for path in paths:
+        parent = path.parent
+        try:
+            relative = parent.relative_to(root)
+            name = str(relative) if str(relative) != "." else (root.name or str(root))
+        except ValueError:
+            name = parent.name or str(parent)
+        groups.setdefault(name, []).append(path)
+    return groups
+
+
 def ping_screen(stdscr, settings) -> str:
-    """Measure every config in the configs dir. Returns a chosen path or None."""
-    paths = xrayconf.list_configs(settings.get("configs_dir"))
+    """Latency of the configs in one group. Returns a chosen path or None.
+
+    Opening this used to probe every config under the configs directory, which
+    is a process and a request each -- fine for a dozen, painful for the few
+    hundred that pile up once subscriptions are in play. The group holding the
+    selected config is what gets tested; `g` switches to another one, or to all
+    of them at once.
+    """
+    root = Path(settings.get("configs_dir") or "")
+    paths = xrayconf.list_configs(root)
+    current = settings.config_path
+    if current and Path(current).is_file() and Path(current) not in paths:
+        # Selected from outside the configs directory: bring its folder along,
+        # since that is the group the user is actually working in.
+        paths = xrayconf.list_configs(Path(current).parent) + paths
     if not paths:
         ui.popup_message(stdscr, "Ping", "No .json configs found in "
                          f"{settings.get('configs_dir')}.\n\n"
@@ -38,11 +76,21 @@ def ping_screen(stdscr, settings) -> str:
                          ui.WARN)
         return None
 
-    session = pinger.PingSession(settings, paths)
+    groups = _config_groups(paths, root)
+    group = next((name for name, members in groups.items()
+                  if current and Path(current) in members), None)
+    if group is None:
+        group = next(iter(groups))
+
+    def scope(name):
+        return paths if name == ALL_GROUPS else groups.get(name, [])
+
+    session = pinger.PingSession(settings, scope(group))
     session.start()
+    selected = next((r.path for r in session.results if str(r.path) == current),
+                    session.results[0].path if session.results else None)
     sort_by = "latency"
     index, top = 0, 0
-    selected = session.results[0].path if session.results else None
     stdscr.timeout(200)
     chosen = None
 
@@ -66,12 +114,16 @@ def ping_screen(stdscr, settings) -> str:
 
         stdscr.erase()
         done = sum(1 for r in rows if r.state in ("ok", "fail"))
-        title = (f" Ping configs — {done}/{len(rows)} tested · mode: "
+        title = (f" Ping — {group} — {done}/{len(rows)} tested · mode: "
                  f"{MODE_LABEL.get(session.mode, session.mode)} ")
         ui.fill_line(stdscr, 0, 0, width, ui.attr(ui.HEADER, True))
         ui.addstr(stdscr, 0, 1, ui.clip(title, width - 2), ui.attr(ui.HEADER, True))
 
-        header = f"{'#':>3}  {'group':<10} {'config':<38} {'result':>10}  detail"
+        # With one group on screen its name is in the title; the column would
+        # just repeat it, so the config name gets the width instead.
+        wide = group == ALL_GROUPS
+        header = (f"{'#':>3}  {'group':<10} {'config':<38} {'result':>10}  detail" if wide
+                  else f"{'#':>3}  {'config':<49} {'result':>10}  detail")
         ui.addstr(stdscr, 1, 1, ui.clip(header, width - 2), ui.attr(ui.DIM, True))
 
         for offset in range(list_height):
@@ -91,17 +143,28 @@ def ping_screen(stdscr, settings) -> str:
             else:
                 style = ui.attr(ui.NORMAL)
             ui.fill_line(stdscr, 2 + offset, 0, width, style)
-            line = (f"{position + 1:>3}  {ui.clip(row.group, 10):<10} "
-                    f"{ui.clip(row.name, 38):<38} {row.label:>10}  {row.detail}")
+            if wide:
+                line = (f"{position + 1:>3}  {ui.clip(row.group, 10):<10} "
+                        f"{ui.clip(row.name, 38):<38} {row.label:>10}  {row.detail}")
+            else:
+                line = (f"{position + 1:>3}  {ui.clip(row.name, 49):<49} "
+                        f"{row.label:>10}  {row.detail}")
             ui.addstr(stdscr, 2 + offset, 1, ui.clip(line, width - 2), style)
 
         best = session.best()
-        status = (f"fastest: {best.group}/{best.name} ({best.ms:.0f} ms)"
-                  if best else "no successful probe yet")
         if session.busy:
-            status = f"testing… {session.pending} left · " + status
+            status = f"testing… {session.pending} left"
+        elif done < len(rows):
+            status = f"{len(rows) - done} untested — p tests the group again"
+        else:
+            status = "no successful probe yet"
+        if best:
+            status += f" · fastest: {best.group}/{best.name} ({best.ms:.0f} ms)"
+        other = len(paths) - len(rows)
+        if other > 0:
+            status += f" · {other} more in other groups (g)"
         ui.addstr(stdscr, height - 3, 1, ui.clip(status, width - 2), ui.attr(ui.DIM))
-        hints = ("Enter use · f use fastest · p ping all · r retest one · "
+        hints = ("Enter use · f use fastest · g group · p retest group · r retest one · "
                  "m mode · s sort · c cancel · Esc back")
         ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
         ui.addstr(stdscr, height - 1, 1, ui.clip(hints, width - 2), ui.attr(ui.HEADER))
@@ -131,6 +194,20 @@ def ping_screen(stdscr, settings) -> str:
             index = max(0, min(index, len(rows) - 1))
             selected = rows[index].path if rows else None
             continue
+        elif key in ("g", "G"):
+            names = list(groups)
+            options = [(name, f"{len(groups[name])} configs") for name in names]
+            options.append((ALL_GROUPS, f"{len(paths)} configs, every group"))
+            picked = ui.popup_list(stdscr, "Ping which group?", options,
+                                   names.index(group) if group in names else len(names))
+            if picked is None:
+                continue
+            group = ALL_GROUPS if picked == len(names) else names[picked]
+            session.cancel()
+            session = pinger.PingSession(settings, scope(group), mode=session.mode)
+            session.start()
+            index, top = 0, 0
+            selected = session.results[0].path if session.results else None
         elif key in ("p", "P"):
             session.start()
         elif key in ("r", "R"):
@@ -149,7 +226,7 @@ def ping_screen(stdscr, settings) -> str:
                 mode = "proxy" if choice == 0 else "tcp"
                 settings.set("ping.mode", mode)
                 session.cancel()
-                session = pinger.PingSession(settings, paths, mode=mode)
+                session = pinger.PingSession(settings, scope(group), mode=mode)
                 session.start()
         elif key in ("f", "F"):
             if best:
@@ -279,6 +356,478 @@ def download_screen(stdscr, settings) -> str:
     lines += [f"  {name}" for name in sorted(installed)]
     ui.popup_message(stdscr, "Done", "\n".join(lines), ui.OK)
     return str(binary)
+
+
+# -- configs: files, subscriptions and links on one page ------------------
+
+def _run_job(stdscr, title: str, work) -> tuple:
+    """Run `work()` off the UI thread behind a one-line box; (result, error)."""
+    state = {}
+
+    def run():
+        try:
+            state["result"] = work()
+        except Exception as exc:                  # network, parsing, disk
+            state["error"] = str(exc) or exc.__class__.__name__
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    stdscr.timeout(120)
+    spinner = "|/-\\"
+    tick = 0
+    while worker.is_alive():
+        height, width = stdscr.getmaxyx()
+        box_width = min(width - 4, 60)
+        top, left = max(0, height // 2 - 2), max(0, (width - box_width) // 2)
+        ui.draw_frame(stdscr, top, left, 5, box_width, "Working", focused=True)
+        ui.addstr(stdscr, top + 1, left + 2, ui.clip(title, box_width - 4), ui.attr(ui.NORMAL))
+        ui.addstr(stdscr, top + 2, left + 2, f"{spinner[tick % 4]} please wait",
+                  ui.attr(ui.DIM))
+        stdscr.refresh()
+        ui.getkey(stdscr)
+        tick += 1
+    worker.join(timeout=1)
+    stdscr.timeout(-1)
+    stdscr.touchwin()
+    return state.get("result"), state.get("error")
+
+
+def _report(stdscr, result: dict) -> None:
+    lines = [f"{result['count']} configs written to", str(result["dir"])]
+    if result.get("failed"):
+        lines += ["", f"{len(result['failed'])} link(s) skipped:"]
+        lines += [f"  {reason} — {link[:50]}" for link, reason in result["failed"][:5]]
+    if result.get("hysteria"):
+        lines += ["", f"{result['hysteria']} hysteria2 entr(ies): upstream Xray-core "
+                      "has no hysteria outbound, only the Happ fork does."]
+    ui.popup_message(stdscr, "Imported", "\n".join(lines), ui.OK)
+
+
+def _edit_headers(stdscr, headers: dict) -> None:
+    """Add, change or drop the request headers a subscription needs."""
+    index = 0
+    while True:
+        keys = sorted(headers)
+        options = [(f"{key}: {ui.clip(str(headers[key]), 40)}", "") for key in keys]
+        options.append(("+ add a header", ""))
+        options.append(("done", ""))
+        index = min(index, len(options) - 1)
+        picked = ui.popup_list(stdscr, "Request headers", options, index,
+                               hint="Enter edit · d delete · Esc done")
+        if picked is None or picked == len(options) - 1:
+            return
+        index = picked
+        if picked == len(options) - 2:
+            name = ui.popup_input(stdscr, "Add header", "Header name:")
+            if not name:
+                continue
+            value = ui.popup_input(stdscr, "Add header", f"Value for {name}:")
+            if value is not None:
+                headers[name.strip()] = value
+            continue
+        key = keys[picked]
+        value = ui.popup_input(stdscr, "Header", f"{key}:", str(headers[key]))
+        if value is None:
+            continue
+        if value == "":
+            headers.pop(key, None)              # emptied means dropped
+        else:
+            headers[key] = value
+
+
+def _edit_profile(stdscr, settings, profile: dict) -> bool:
+    """Name / URL / headers for one profile; False when nothing was changed."""
+    before = json.dumps(profile, sort_keys=True)
+    while True:
+        picked = ui.popup_list(stdscr, "Profile", [
+            (f"Name             {profile.get('name', '')}", ""),
+            (f"Subscription URL {ui.clip(profile.get('sub_url', ''), 46)}", ""),
+            (f"Headers          {len(profile.get('headers') or {})} set",
+             "what the subscription checks: HWID, IP, device"),
+            ("done", ""),
+        ], 0)
+        if picked is None or picked == 3:
+            break
+        if picked == 0:
+            value = ui.popup_input(stdscr, "Profile", "Name:", profile.get("name", ""))
+            if value:
+                profile["name"] = value.strip()
+        elif picked == 1:
+            value = ui.popup_input(stdscr, "Profile", "Subscription URL (happ:// works too):",
+                                   profile.get("sub_url", ""))
+            if value:
+                profile["sub_url"] = value.strip()
+        else:
+            profile.setdefault("headers", subs.default_headers(settings))
+            _edit_headers(stdscr, profile["headers"])
+    return json.dumps(profile, sort_keys=True) != before
+
+
+def _links_counter(text: str) -> str:
+    found, failed = links.parse_all(text)
+    note = f"{len(found)} link(s) recognised"
+    if failed:
+        note += f", {len(failed)} not supported"
+    return note
+
+
+
+TYPE_LABEL = {"file": "config file", "folder": "configs folder",
+              "subscription": "url subscription", "links": "protocol link",
+              "all": "everything"}
+
+
+def _sources(settings) -> list:
+    """Everything that can produce configs, as one list of rows.
+
+    Subscriptions come from the submodule's profiles.json so the command-line
+    converter and the TUI stay in step; file and link sources are tuiray's own.
+    The last row is the whole configs directory, which is always there and
+    cannot be removed -- nothing the user already has can end up invisible.
+    """
+    rows = []
+    for profile in subs.load_profiles(settings):
+        directory = subs.profile_dir(settings, profile.get("name") or "")
+        rows.append({"type": "subscription", "name": profile.get("name") or "unnamed",
+                     "detail": profile.get("sub_url", ""), "dir": directory,
+                     "count": subs.count_configs(directory), "profile": profile})
+    for source in subs.load_sources(settings):
+        directory = subs.source_dir(settings, source)
+        if source.get("type") == "links":
+            count = len(links.split(source.get("links") or ""))
+            detail = f"{count} link{'s' if count != 1 else ''}"
+        else:
+            detail = str(directory) + ("" if directory.exists() else "  — MISSING")
+        rows.append({"type": source.get("type") or "file", "name": source["name"],
+                     "detail": detail, "dir": directory,
+                     "count": subs.count_configs(directory), "source": source})
+    root = Path(settings.get("configs_dir") or "")
+    rows.append({"type": "all", "name": "configs directory", "detail": str(root),
+                 "dir": root, "count": subs.count_configs(root)})
+    return rows
+
+
+def _pick_from(stdscr, settings, row: dict) -> str:
+    """Choose one config out of a source; returns a path or None."""
+    directory = row["dir"]
+    if directory and directory.is_file():
+        return str(directory)
+    if not directory or not directory.is_dir() or not row["count"]:
+        ui.popup_message(stdscr, "Nothing there",
+                         f"{directory} holds no configs yet."
+                         + ("\n\nPress u to fetch it." if row["type"] == "subscription" else ""),
+                         ui.WARN)
+        return None
+    return ui.file_browser(stdscr, str(directory), f"Config from {row['name']}",
+                           extensions=(".json",))
+
+
+def _add_source(stdscr, settings) -> str:
+    """Add a file, a folder, a subscription or pasted links; returns a config."""
+    picked = ui.popup_list(stdscr, "Add", [
+        ("Config file", "one .json config"),
+        ("Configs folder", "a folder of them, scanned as it is"),
+        ("URL subscription", "saved with its headers, fetched on demand"),
+        ("Protocol link", "paste vless:// vmess:// trojan:// ss:// links"),
+    ], 0)
+    if picked == 0:
+        return _add_path(stdscr, settings, folder=False)
+    if picked == 1:
+        return _add_path(stdscr, settings, folder=True)
+    if picked == 2:
+        _add_subscription(stdscr, settings)
+    elif picked == 3:
+        return _add_links(stdscr, settings)
+    return None
+
+
+def _add_path(stdscr, settings, folder: bool, source: dict = None) -> str:
+    """Remember a config file or a folder of them; returns a config to use."""
+    start = (source or {}).get("path") or settings.get("configs_dir") or str(Path.home())
+    path = ui.file_browser(
+        stdscr, start,
+        "Select a folder of configs  (d takes the one you are in)" if folder
+        else "Select a config file",
+        extensions=(".json",), pick_dir=folder)
+    if not path:
+        return None
+    chosen = Path(path)
+    if folder and chosen.is_file():          # picked a file in folder mode
+        chosen = chosen.parent
+    kind = "folder" if chosen.is_dir() else "file"
+
+    sources = subs.load_sources(settings)
+    if source is not None:
+        source.update({"type": kind, "path": str(chosen)})
+    elif not any(item.get("path") == str(chosen) for item in sources):
+        sources.append({"type": kind, "path": str(chosen),
+                        "name": chosen.name if kind == "folder" else chosen.stem})
+    subs.save_sources(settings, sources)
+    return str(chosen) if kind == "file" else None
+
+
+def _add_subscription(stdscr, settings) -> None:
+    profile = {"name": "", "sub_url": "", "headers": subs.default_headers(settings)}
+    if not _edit_profile(stdscr, settings, profile) or not profile["sub_url"]:
+        return
+    profiles = subs.load_profiles(settings)
+    profiles.append(profile)
+    subs.save_profiles(settings, profiles)
+    if ui.popup_confirm(stdscr, "Fetch now?",
+                        f"Fetch '{profile['name'] or 'it'}' and write its configs?"):
+        _update_row(stdscr, settings,
+                    {"type": "subscription", "name": profile.get("name", ""),
+                     "profile": profile})
+
+
+def _add_links(stdscr, settings, source: dict = None) -> str:
+    """Paste links into a new source, or re-edit the links of an existing one."""
+    default = (source or {}).get("name", "links")
+    name = ui.popup_input(stdscr, "Protocol link", "Name for these links:", default)
+    if not name:
+        return None
+    text = ui.popup_paste(
+        stdscr, "Protocol link",
+        "vless:// vmess:// trojan:// ss:// — one per line, or a base64 blob",
+        counter=_links_counter, initial=(source or {}).get("links", ""))
+    if not text:
+        return None
+
+    result, error = _run_job(stdscr, f"writing configs for {name}",
+                             lambda: subs.import_text(settings, name.strip(), text))
+    if error:
+        ui.popup_message(stdscr, "Import failed", error, ui.ERROR)
+        return None
+
+    sources = subs.load_sources(settings)
+    entry = source if source is not None else {"type": "links"}
+    entry.update({"type": "links", "name": name.strip(), "links": text})
+    if source is None:
+        sources.append(entry)
+    subs.save_sources(settings, sources)
+    _report(stdscr, result)
+
+    written = sorted(result["dir"].glob("*.json"))
+    if len(written) == 1:
+        return str(written[0])
+    return None
+
+
+def _update_row(stdscr, settings, row: dict) -> None:
+    """Re-fetch a subscription, or rewrite a link source's configs."""
+    if row["type"] == "subscription":
+        result, error = _run_job(stdscr, f"fetching {row['name']}",
+                                 lambda: subs.update_profile(settings, row["profile"]))
+    elif row["type"] == "links":
+        result, error = _run_job(stdscr, f"rewriting {row['name']}",
+                                 lambda: subs.refresh_links(settings, row["source"]))
+    else:
+        ui.popup_message(stdscr, "Nothing to update",
+                         "A config file is read from disk as it is.", ui.DIM)
+        return
+    if error:
+        ui.popup_message(stdscr, "Update failed", error, ui.ERROR)
+    else:
+        _report(stdscr, result)
+
+
+def _edit_row(stdscr, settings, row: dict) -> None:
+    if row["type"] == "subscription":
+        profiles = subs.load_profiles(settings)
+        target = next((p for p in profiles if p.get("name") == row["name"]), None)
+        if target is not None and _edit_profile(stdscr, settings, target):
+            subs.save_profiles(settings, profiles)
+    elif row["type"] == "links":
+        sources = subs.load_sources(settings)
+        target = next((s for s in sources if s.get("name") == row["name"]), None)
+        if target is not None:
+            _add_links(stdscr, settings, target)
+    elif row["type"] in ("file", "folder"):
+        sources = subs.load_sources(settings)
+        target = next((item for item in sources if item.get("name") == row["name"]), None)
+        _add_path(stdscr, settings, folder=row["type"] == "folder", source=target)
+    else:
+        path = ui.file_browser(stdscr, settings.get("configs_dir") or str(Path.home()),
+                               "Configs directory", extensions=None, pick_dir=True)
+        if path:
+            settings.set("configs_dir", path)
+
+
+def _delete_row(stdscr, settings, row: dict) -> None:
+    if row["type"] == "all":
+        ui.popup_message(stdscr, "Cannot remove",
+                         "The configs directory is where everything lands.", ui.WARN)
+        return
+    what = TYPE_LABEL.get(row["type"], row["type"])
+    if not ui.popup_confirm(stdscr, "Remove", f"Remove the {what} '{row['name']}'?",
+                            default_yes=False):
+        return
+    if row["type"] == "subscription":
+        profiles = [p for p in subs.load_profiles(settings) if p.get("name") != row["name"]]
+        subs.save_profiles(settings, profiles)
+    else:
+        sources = [s for s in subs.load_sources(settings) if s.get("name") != row["name"]]
+        subs.save_sources(settings, sources)
+
+    # The exported configs are files on disk; they are only ours to delete for
+    # sources that wrote them, and only when asked.
+    directory = row["dir"]
+    if (row["type"] in ("subscription", "links") and directory and directory.is_dir()
+            and ui.popup_confirm(stdscr, "Delete configs too?",
+                                 f"Also delete {row['count']} config(s) in\n{directory}?",
+                                 default_yes=False)):
+        for stale in directory.glob("*.json"):
+            stale.unlink()
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def configs_screen(stdscr, settings) -> str:
+    """Every config source on one page. Returns a config to select, or None."""
+    index, chosen = 0, None
+    stdscr.timeout(-1)
+
+    while True:
+        rows = _sources(settings)
+        height, width = stdscr.getmaxyx()
+        list_height = max(1, height - 4)
+        index = max(0, min(index, len(rows) - 1))
+        top = max(0, min(index - list_height + 1, len(rows) - list_height))
+        top = max(0, top)
+
+        stdscr.erase()
+        ui.fill_line(stdscr, 0, 0, width, ui.attr(ui.HEADER, True))
+        ui.addstr(stdscr, 0, 1, " Configs ", ui.attr(ui.HEADER, True))
+        right = f"{subs.status()} "
+        ui.addstr(stdscr, 0, max(0, width - len(right) - 1), right, ui.attr(ui.HEADER))
+
+        header = f"{'#':>3}  {'type':<17} {'name':<20} {'configs':>7}  where"
+        ui.addstr(stdscr, 1, 1, ui.clip(header, width - 2), ui.attr(ui.DIM, True))
+
+        for offset in range(min(list_height, len(rows) - top)):
+            position = top + offset
+            row = rows[position]
+            selected = position == index
+            style = ui.attr(ui.SELECT) if selected else ui.attr(ui.NORMAL)
+            ui.fill_line(stdscr, 2 + offset, 0, width, style)
+            number = "·" if row["type"] == "all" else str(position + 1)
+            line = (f"{number:>3}  {TYPE_LABEL.get(row['type'], row['type']):<17} "
+                    f"{ui.clip(row['name'], 20):<20} {row['count']:>7}  {row['detail']}")
+            ui.addstr(stdscr, 2 + offset, 1, ui.clip(line, width - 2), style)
+
+        if len(rows) == 1:                 # only the configs directory
+            ui.addstr(stdscr, 4, 3, "Nothing added yet — press a to add a config file, "
+                      "a subscription URL or pasted links.", ui.attr(ui.DIM))
+
+        hints = ("Enter use · a add · u update · e edit · d remove · "
+                 "s show links · c use as configs dir · Esc back")
+        ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
+        ui.addstr(stdscr, height - 1, 1, ui.clip(hints, width - 2), ui.attr(ui.HEADER))
+        stdscr.refresh()
+
+        key = ui.getkey(stdscr)
+        if key is None or key == curses.KEY_RESIZE:
+            continue
+        if ui.is_escape(key) or key in ("q", "Q"):
+            break
+        row = rows[index]
+
+        if key in (curses.KEY_UP, "k"):
+            index -= 1
+        elif key in (curses.KEY_DOWN, "j"):
+            index += 1
+        elif key == curses.KEY_HOME:
+            index = 0
+        elif key == curses.KEY_END:
+            index = len(rows) - 1
+        elif key in ("a", "A"):
+            picked = _add_source(stdscr, settings)
+            index = 0
+            if picked:
+                chosen = picked
+                break
+        elif key in ("u", "U"):
+            _update_row(stdscr, settings, row)
+        elif key in ("e", "E"):
+            _edit_row(stdscr, settings, row)
+        elif key in ("d", "D"):
+            _delete_row(stdscr, settings, row)
+            index = max(0, index - 1)
+        elif key in ("s", "S"):
+            found, error = _run_job(stdscr, f"reading configs of {row['name']}",
+                                    lambda: subs.share_links_from(settings, row["dir"]))
+            if error:
+                ui.popup_message(stdscr, "Cannot build links", error, ui.ERROR)
+            elif not found:
+                ui.popup_message(stdscr, "No links",
+                                 "Nothing to turn into links here yet.", ui.WARN)
+            else:
+                _show_links(stdscr, settings, row["name"], found)
+        elif key in ("c", "C"):
+            if row["dir"] and row["dir"].is_dir():
+                settings.set("configs_dir", str(row["dir"]))
+            else:
+                ui.popup_message(stdscr, "Not a folder",
+                                 "Only a folder can be the configs directory.", ui.WARN)
+        elif ui.is_enter(key):
+            picked = _pick_from(stdscr, settings, row)
+            if picked:
+                chosen = picked
+                break
+
+    stdscr.timeout(-1)
+    return chosen
+
+
+def _show_links(stdscr, settings, name: str, found: list) -> None:
+    """Scrollable list of share links, with a key to write them to a file."""
+    index = 0
+    stdscr.timeout(-1)
+    while True:
+        height, width = stdscr.getmaxyx()
+        rows = max(1, height - 4)
+        index = max(0, min(index, len(found) - 1))
+        top = max(0, min(index - rows // 2, len(found) - rows))
+
+        stdscr.erase()
+        ui.fill_line(stdscr, 0, 0, width, ui.attr(ui.HEADER, True))
+        ui.addstr(stdscr, 0, 1, f" Share links — {name} ({len(found)}) ",
+                  ui.attr(ui.HEADER, True))
+        for offset in range(min(rows, len(found) - top)):
+            position = top + offset
+            style = ui.attr(ui.SELECT) if position == index else ui.attr(ui.NORMAL)
+            ui.fill_line(stdscr, 1 + offset, 0, width, style)
+            ui.addstr(stdscr, 1 + offset, 1, ui.clip(found[position], width - 2), style)
+        ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
+        ui.addstr(stdscr, height - 1, 1,
+                  "w write them to a file · ↑/↓ scroll · Esc back", ui.attr(ui.HEADER))
+        stdscr.refresh()
+
+        key = ui.getkey(stdscr)
+        if key in (curses.KEY_UP, "k"):
+            index -= 1
+        elif key in (curses.KEY_DOWN, "j"):
+            index += 1
+        elif key == curses.KEY_NPAGE:
+            index += rows
+        elif key == curses.KEY_PPAGE:
+            index -= rows
+        elif key in ("w", "W"):
+            default = str(Path(settings.get("configs_dir")) / f"{subs.safe_name(name)}.txt")
+            path = ui.popup_input(stdscr, "Write links", "File:", default)
+            if not path:
+                continue
+            try:
+                Path(path).write_text("\n".join(found) + "\n", encoding="utf-8")
+            except OSError as exc:
+                ui.popup_message(stdscr, "Cannot write", str(exc), ui.ERROR)
+            else:
+                ui.popup_message(stdscr, "Written",
+                                 f"{len(found)} links → {path}", ui.OK)
+        elif ui.is_escape(key) or key in ("q", "Q"):
+            return
 
 
 # -- settings -------------------------------------------------------------
@@ -590,6 +1139,16 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
             ("item", "Stats API port", settings.get("stats.api_port"),
              edit.number("stats.api_port",
                            "Loopback port xray exposes its stats API on:")),
+
+            ("section", "Subscriptions", "", None),
+            ("item", "Happ-converter submodule", subs.status(), None),
+            ("item", "Profiles file", str(subs.profiles_file(settings)),
+             edit.file("subs.profiles_file", "Select a profiles.json", (".json",))),
+            ("item", "Fetch timeout (s)", settings.get("subs.timeout"),
+             edit.number("subs.timeout", "Seconds to wait for a subscription:", float)),
+            ("item", "Device id (X-Hwid)",
+             settings.get("subs.hwid") or "(made on first use)",
+             edit.text("subs.hwid", "X-Hwid sent with new profiles:")),
 
             ("section", "Connection watchdog", "", None),
             ("item", "Watch the connection",

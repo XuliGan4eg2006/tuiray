@@ -1,21 +1,22 @@
 # tuiray
 
-An `nmtui`-style terminal UI for [Xray](https://github.com/XTLS/Xray-core), built for
-the configs this repo exports (`export_configs.py` → `configs/<profile>/*.json`).
+An `nmtui`-style terminal UI for [Xray](https://github.com/XTLS/Xray-core): pick a
+config, start it as a local proxy or a system-wide tunnel, watch it, share it, and
+keep subscriptions up to date.
 
 Pure Python 3 + `curses` — no third-party packages.
 
 ```
   TUIray — xray control                                                 dmitry
 ┌─ Connection ───────────────────────────────────┐┌─ Status ───────────────────┐
-│   Config          savevpn/02_Литва.json  [hys… ││ ● running                  │
+│ ▸ Config          whit/00_Авто_Быстрый.json    ││ ● running                  │
 │   Mode            Proxy — local SOCKS + HTTP   ││ pid    12345               │
-│   Routing         LAN/private direct           ││ uptime 00:12:33            │
-│   Share           wifi TUIray · stopped · lan… ││ mode   proxy               │
-│ ▸ Watchdog        watching · proxy 46 ms · di… │└────────────────────────────┘
-│                                                │┌─ Traffic ──────────────────┐
-│ ────────────────────────────────────────────── ││         rate     total     │
-│                                                ││ ↓   1.2 MB/s  472.0 MB     │
+│   System proxy    on · desktop says manual     ││ uptime 00:12:33            │
+│   Routing         LAN/private direct           ││ mode   proxy               │
+│   Share           wifi TUIray · stopped · lan… │└────────────────────────────┘
+│   Watchdog        watching · proxy 46 ms · di… │┌─ Traffic ──────────────────┐
+│                                                ││         rate     total     │
+│ ────────────────────────────────────────────── ││ ↓   1.2 MB/s  472.0 MB     │
 │   Stop xray                                    ││ ↑  43.9 KB/s   12.7 MB     │
 │   Restart                                      │└────────────────────────────┘
 │ ────────────────────────────────────────────── │┌─ Watchdog ─────────────────┐
@@ -26,28 +27,70 @@ Pure Python 3 + `curses` — no third-party packages.
 ┌─ Xray log — 4 lines ─────────────────────────────────────────────────────────┐
 │ [tuiray] mode=proxy  config=…/configs/savevpn/02_Литва.json                  │
 │ 2026/09/22 12:10:26 [Warning] core: Xray 26.7.28 started                     │
-│ [tuiray] watchdog enabled                                                    │
-│ [tuiray] watchdog: proxy check failed (timed out) [1/2]                      │
+│ [tuiray] system proxy: set (GNOME)                                           │
+│ [tuiray] watchdog: proxy 46 ms · direct 61 ms                                │
 └──────────────────────────────────────────────────────────────────────────────┘
- Tab pane · Enter activate · s start/stop · R restart · p ping · w share · h w…
+ Tab pane · Enter activate · s start/stop · R restart · p ping · u configs · w…
+```
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XuliGan4eg2006/tuiray/master/install.sh | sh
+```
+
+Or, if piping a script into a shell makes you uneasy — it should — read it first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XuliGan4eg2006/tuiray/master/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+It needs `git` and a `python3` that can `import curses`, installs nothing else,
+and never asks for root:
+
+| Path | What |
+|------|------|
+| `~/.local/share/tuiray/app/` | the checkout, cloned **with its submodule** |
+| `~/.local/share/tuiray/` | where *Get xray* puts `xray`, `geoip.dat`, `geosite.dat` |
+| `~/.local/bin/tuiray` | the launcher (it tells you if that is not on your `PATH`) |
+| `~/.local/bin/tuiray-update` | self-contained updater |
+
+```bash
+tuiray                     # run it
+tuiray-update              # or: sh install.sh --update
+sh install.sh --uninstall  # program only; settings, profiles and configs stay
+sh install.sh --purge      # everything, including ~/.config/tuiray
+```
+
+`TUIRAY_REPO`, `TUIRAY_REF`, `TUIRAY_DIR`, `TUIRAY_BIN` override where it comes
+from and where it goes; `TUIRAY_FORCE=1` lets an update discard local edits.
+
+**From source** instead — the submodule is the part people forget:
+
+```bash
+git clone --recursive https://github.com/XuliGan4eg2006/tuiray
+python3 tuiray/main.py
+# in an existing clone:  git submodule update --init
 ```
 
 ## Run
 
 ```bash
-python3 tuiray/main.py          # or ./tuiray/main.py
+tuiray                          # installed
+python3 tuiray/main.py          # from a checkout
 ```
 
 On first start it finds the `xray` binary, `configs/`, `geoip.dat` and `geosite.dat`
-next to the repo. Everything is changeable from the UI — and if there is no xray
+next to the checkout. Everything is changeable from the UI — and if there is no xray
 binary at all, the menu offers to **download one** for this machine (see below).
 
 Command line extras:
 
 ```bash
-python3 tuiray/main.py -c configs/rfn/03_RFN-_Эстония.json -m tun   # preselect
-python3 tuiray/main.py --status                                     # is it up?
-python3 tuiray/main.py --stop                                       # stop it
+tuiray -c configs/rfn/03_RFN-_Эстония.json -m tun   # preselect
+tuiray --status                                     # is it up?
+tuiray --stop                                       # stop it
 ```
 
 ## Main screen
@@ -61,7 +104,7 @@ the bottom of the screen.
 | Row | What it does |
 |-----|--------------|
 | **Get xray** | only shown when there is no binary: downloads the newest release for this machine (see below) |
-| **Config** | file browser over `configs/` — the `.json` xray actually runs |
+| **Config** | the configs page: config files, URL subscriptions and protocol links, all on one page (see below) |
 | **Mode** | Proxy (local SOCKS + HTTP) or TUN (system-wide) |
 | **System proxy** | point the desktop's proxy settings at our inbounds while xray runs (see below) |
 | **Routing** | split-routing rules layered on top of the config (see below) |
@@ -133,6 +176,103 @@ Creating the device and editing the routing table needs `CAP_NET_ADMIN`. Either:
 * **sudo** — leave it as is and the TUI asks for your sudo password when starting in
   TUN mode (kept in memory only, for the lifetime of the TUI, so it can also stop
   the root-owned process).
+
+## Configs
+
+`Enter` on the **Config** row (or `u` from the main screen) opens the page where
+every source of configs lives — the three kinds side by side, with the number of
+configs each one currently has on disk:
+
+```
+   #  type              name                 configs  where
+   1  url subscription  whit                      43  https://example.com/sub1
+   2  url subscription  savevpn                   23  https://example.com/sub2
+   3  protocol link     pasted                     4  4 links
+   4  configs folder    spare                     12  /home/you/configs/spare
+   5  config file       lab                        1  /home/you/configs/lab.json
+   ·  everything        configs directory         82  /home/you/subextractor/configs
+ Enter use · a add · u update · e edit · d remove · s show links · c use as configs dir · Esc back
+```
+
+| Key | What it does |
+|-----|--------------|
+| `Enter` | pick a config out of that source and run it |
+| `a` | add a **config file**, a **configs folder**, a **URL subscription** or a **protocol link** |
+| `u` | update: fetch a subscription again, or rewrite a link source's configs |
+| `e` | edit: name / URL / headers, the stored links, or the folder |
+| `d` | remove the source, and optionally the configs it wrote |
+| `s` | show its configs as share links, and write them to a file |
+| `c` | make that folder the configs directory the ping tool scans |
+
+The last row is the configs directory itself. It is always there and cannot be
+removed, so nothing you already have can become invisible.
+
+| Type | Where it is kept | What `update` does |
+|------|------------------|--------------------|
+| **config file** | a path in `settings.json` | nothing: it is read from disk as it is |
+| **configs folder** | a path in `settings.json`; every `.json` under it counts, recursively | nothing, same reason |
+| **URL subscription** | `profiles.json`, shared with the command-line converter | fetches it and rewrites `configs/<name>/` |
+| **protocol link** | the links themselves, in `settings.json` | rewrites `configs/<name>/` from those links |
+
+A folder is added with `d` in the browser ("use this dir"); a path that later
+disappears is shown as `— MISSING` rather than quietly counting zero.
+
+Adding a subscription asks for the name, URL (`happ://crypt` works) and the
+request headers it needs, then offers to fetch it straight away. The headers
+start from Happ's own set plus an **`X-Hwid`** — 16 hex characters identifying
+this machine, made once and kept in `settings.json` (*Settings → Subscriptions →
+Device id*), because a subscription that counts devices should see one. Edit it
+per profile in the header editor, or globally in Settings. `e` on it
+reopens the same editor; `e` on a link source reopens the paste box with the
+links already in it.
+
+### Where the work happens
+
+The Happ-converter submodule in `Happ-converter/` does what it already does well,
+and tuiray does not reimplement it:
+
+| From the submodule | Used for |
+|--------------------|----------|
+| `export_configs.export_for_profile` | one Xray config per subscription entry, into `configs/<profile>/` |
+| `parser.parse_response` | the reverse, for the **show links** view |
+| `profiles.load_profiles` / `save_profiles` | reading and writing `profiles.json` |
+| `happ_decrypt.decrypt` | `happ://crypt` subscription links |
+
+The fetch itself is tuiray's, on `urllib`, so a machine with nothing installed can
+still update a subscription — and because `urllib` does not undo `Content-Encoding`
+the way `requests` does, the gzip the Happ profiles ask for is unpacked here.
+`requests` and `cryptography` are only needed for the parts that use them
+(`profiles.py` reaches for `requests` through `ipdetect`, `happ_decrypt` for
+`cryptography`); without them the profile list falls back to reading the same JSON
+directly, and only `happ://crypt` links stop working.
+
+`profiles.json` lives next to the submodule by default. To share one list with the
+command-line converter, point *Settings → Subscriptions → Profiles file* at that
+checkout's `profiles.json` — the two then read and write the same file, so a
+profile added in the TUI shows up in the converter and the other way round.
+
+### Protocol links
+
+Adding a **protocol link** source opens a paste box: `Enter` starts a new line,
+so a terminal paste of forty links arrives whole, and the footer counts what it
+recognises as you go. One config per link is written under the configs
+directory, and a single link is selected right away. The same parser handles a
+base64 blob, which is what a plain subscription URL returns.
+
+| Scheme | Notes |
+|--------|-------|
+| `vless://` | reality, xtls-rprx-vision, ws / grpc / xhttp / httpupgrade / kcp / tcp-http, including the `extra` obfuscation object |
+| `vmess://` | the v2rayN base64-JSON form |
+| `trojan://` | with the same transports |
+| `ss://` | SIP002 and the older all-base64 form |
+| `socks://` | with or without credentials |
+| `hysteria2://` / `hy2://` | parsed, but **upstream Xray-core has no hysteria outbound** — only the Happ fork runs these, and the import says how many it wrote |
+
+Anything else (`wireguard://` …) is reported as unsupported rather than dropped
+silently. A share link cannot carry routing rules, balancers, the observatory or
+`enableSessionResumption`, which is exactly why a Happ subscription is imported as
+whole configs instead: use the links path for servers that arrive as links, and
+`Enter` on a profile for everything else.
 
 ## Getting xray
 
@@ -439,8 +579,30 @@ leaves everything alone.
 
 ## Ping tool
 
-`p` from the main menu tests every `*.json` under the configs directory and sorts by
-latency. `Enter` selects the highlighted config, `f` selects the fastest one.
+`p` from the main menu tests **the group the selected config is in** — a group being
+one folder under the configs directory, which is exactly what a subscription exports
+into. Each probe is a process and a request, so testing all 200 configs on the
+machine because you wanted to know how `whit` is doing today is not a good trade.
+
+```
+  Ping — whit — 43/43 tested · mode: proxy latency (starts xray per config)
+   #  config                                                result  detail
+   1  02_Эстония_Скоростной                                  118 ms
+   2  00_Авто_Быстрый                                        141 ms
+ fastest: whit/02_Эстония_Скоростной (118 ms) · 176 more in other groups (g)
+```
+
+| Key | What it does |
+|-----|--------------|
+| `g` | switch group — or *all groups*, the old behaviour |
+| `p` | test the group again |
+| `r` | test just the highlighted config |
+| `Enter` | select the highlighted config |
+| `f` | select the fastest one measured so far |
+| `m` / `s` / `c` | probe mode, sort order, cancel what is running |
+
+The status line says how many configs live in the other groups. If the selected
+config sits outside the configs directory, its own folder comes along as a group.
 
 * **proxy latency** (default) starts a private xray per config on a throwaway SOCKS
   port and times a real request to `http://cp.cloudflare.com/generate_204` through it.
@@ -457,6 +619,7 @@ leave the screen.
 | Path | What |
 |------|------|
 | `~/.config/tuiray/settings.json` | all settings; saved on every change |
+| `tuiray/Happ-converter/profiles.json` | subscription profiles (URL + headers); the path is a setting |
 | `~/.cache/tuiray/run.json` | the config actually handed to xray (original + rewritten inbounds) |
 | `~/.cache/tuiray/xray.log` | xray output, tailed by the log pane |
 | `~/.cache/tuiray/xray.pid` | pid/mode/config of the running instance, for re-attaching |
@@ -472,6 +635,7 @@ mode, and the copy is what runs. Routing, DNS, balancers and outbounds are untou
 ## Layout
 
 ```
+install.sh    one-line installer: clone, link, update, remove
 main.py       entry point, CLI flags
 app.py        main screen: status, menu, log pane
 screens.py    ping tool and settings screens
@@ -482,5 +646,8 @@ watchdog.py   periodic proxy/internet health checks and the config switch
 share.py      Wi-Fi AP and wired sharing: NM profiles, dnsmasq, nft, teardown
 xrayconf.py   config loading, inbound rewriting for proxy/TUN, stats API block
 xrayget.py    platform detection and the release download for the xray binary
+subs.py       the Happ-converter bridge: profiles, fetching, writing configs
+links.py      protocol:// share links -> xray configs
+Happ-converter/  the submodule: subscription parsing and config export
 settings.py   persisted settings
 ```

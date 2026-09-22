@@ -9,6 +9,7 @@ from pathlib import Path
 import runner
 import screens
 import share
+import subs
 import ui
 import watchdog
 import xrayconf
@@ -70,6 +71,21 @@ class App:
             return f"TUN — system-wide via {tun.get('name', 'tun0')}"
         return "Proxy — local SOCKS + HTTP"
 
+    def sources_label(self) -> str:
+        """What the Config row shows next to the file name."""
+        profiles = subs.profile_count(self.settings) if subs.installed() else 0
+        added = len(subs.load_sources(self.settings))
+        parts = []
+        if profiles:
+            parts.append(f"{profiles} subscription{'s' if profiles > 1 else ''}")
+        if added:
+            parts.append(f"{added} added source{'s' if added > 1 else ''}")
+        return " · ".join(parts)
+
+    def short_configs_dir(self) -> str:
+        directory = Path(self.settings.get("configs_dir") or "")
+        return f"{directory.parent.name}/{directory.name}" if directory.name else "(not set)"
+
     def sysproxy_label(self) -> str:
         if not self.settings.get("proxy.set_system_proxy"):
             return "off"
@@ -113,7 +129,8 @@ class App:
                          "accent": True})
         return rows + [
             {"id": "config", "label": "Config", "value": self.short_config(),
-             "note": self.config_summary()},
+             "note": " · ".join(part for part in (self.config_summary(),
+                                                  self.sources_label()) if part)},
             {"id": "mode", "label": "Mode", "value": self.mode_label()},
             {"id": "sysproxy", "label": "System proxy", "value": self.sysproxy_label()},
             {"id": "routing", "label": "Routing", "value": self.routing_label()},
@@ -185,7 +202,7 @@ class App:
         self._draw_log(log_top, 0, max(3, height - 1 - log_top), width)
 
         footer = ("Tab pane · Enter activate · s start/stop · R restart · p ping · "
-                  "w share · h watchdog · g settings · c clear log · q quit")
+                  "u configs · w share · h watchdog · g settings · c clear log · q quit")
         if self.message and time.time() < self.message_until:
             footer = self.message
         ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
@@ -520,10 +537,18 @@ class App:
         self.start()
 
     def pick_config(self) -> None:
-        start = self.settings.config_path or self.settings.get("configs_dir")
-        path = ui.file_browser(self.stdscr, start, "Select xray config", extensions=(".json",))
-        if path:
-            self.use_config(path)
+        """The configs page: every source, and the three ways to add one."""
+        before = self.settings.get("configs_dir")
+        self.watchdog.pause()
+        try:
+            chosen = screens.configs_screen(self.stdscr, self.settings)
+        finally:
+            self.watchdog.resume()
+        self.summary_for = None
+        if self.settings.get("configs_dir") != before:
+            self.notify(f"configs directory: {self.settings.get('configs_dir')}", 6)
+        if chosen:
+            self.use_config(chosen)
 
     def use_config(self, path: str) -> None:
         try:
@@ -735,6 +760,9 @@ class App:
                 continue
             if key in ("w", "W"):
                 self.open_share()
+                continue
+            if key in ("u", "U"):
+                self.pick_config()
                 continue
             if key in ("h", "H"):
                 self.notify("watchdog " + ("enabled" if self.watchdog.toggle() else "disabled"))
