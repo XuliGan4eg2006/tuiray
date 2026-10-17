@@ -181,9 +181,9 @@ def sha256(path: Path) -> str:
 # -- installing -----------------------------------------------------------
 
 def install_dir() -> Path:
-    """Where the binary goes: next to the repo if we may write there.
+    """Where the binary goes: the tuiray folder, if we may write there.
 
-    The repo is where settings.py already looks for xray and the .dat files on
+    That folder is where settings.py already looks for xray and the .dat files on
     a first run, so a download that lands there needs no settings at all if the
     config is ever thrown away.
     """

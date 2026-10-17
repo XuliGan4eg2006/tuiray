@@ -1,2 +1,8 @@
 __pycache__/
 *.py[cod]
+
+# downloaded by tuiray
+/xray
+/xray.exe
+/geoip.dat
+/geosite.dat

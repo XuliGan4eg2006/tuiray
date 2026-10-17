@@ -13,7 +13,6 @@ import runner
 import share
 import ui
 import subs
-import xrayconf
 import xrayget
 
 
@@ -34,49 +33,29 @@ DHCP_LABEL = {
 ALL_GROUPS = "all groups"
 
 
-def _config_groups(paths: list, root: Path) -> dict:
-    """{group name: [config paths]} -- one group per folder under the root.
-
-    A subscription exports into its own folder, so the folder is the natural
-    unit: "test the configs of the profile I am on" rather than every config
-    on the machine.
-    """
-    groups = {}
-    for path in paths:
-        parent = path.parent
-        try:
-            relative = parent.relative_to(root)
-            name = str(relative) if str(relative) != "." else (root.name or str(root))
-        except ValueError:
-            name = parent.name or str(parent)
-        groups.setdefault(name, []).append(path)
-    return groups
-
-
 def ping_screen(stdscr, settings) -> str:
     """Latency of the configs in one group. Returns a chosen path or None.
 
-    Opening this used to probe every config under the configs directory, which
-    is a process and a request each -- fine for a dozen, painful for the few
-    hundred that pile up once subscriptions are in play. The group holding the
-    selected config is what gets tested; `g` switches to another one, or to all
-    of them at once.
+    A group is one source from the configs page -- a subscription, a folder,
+    a set of pasted links. The group holding the selected config is what gets
+    tested; `g` switches to another one, or to all of them at once. Nothing
+    outside the added sources is read.
     """
-    root = Path(settings.get("configs_dir") or "")
-    paths = xrayconf.list_configs(root)
+    groups = subs.source_groups(settings)
     current = settings.config_path
+    paths = subs.all_configs(settings)
     if current and Path(current).is_file() and Path(current) not in paths:
-        # Selected from outside the configs directory: bring its folder along,
-        # since that is the group the user is actually working in.
-        paths = xrayconf.list_configs(Path(current).parent) + paths
+        # Selected from somewhere that is not a source (an older version, or
+        # --config): test its own folder, the group the user is working in.
+        here = subs.configs_in(Path(current).parent)
+        groups = {Path(current).parent.name or "selected": here, **groups}
+        paths = here + paths
     if not paths:
-        ui.popup_message(stdscr, "Ping", "No .json configs found in "
-                         f"{settings.get('configs_dir')}.\n\n"
-                         "Point 'Configs directory' at your exported configs in Settings.",
+        ui.popup_message(stdscr, "Ping", "No configs to test yet.\n\n"
+                         "Add a subscription, a folder or links on the Config page.",
                          ui.WARN)
         return None
 
-    groups = _config_groups(paths, root)
     group = next((name for name, members in groups.items()
                   if current and Path(current) in members), None)
     if group is None:
@@ -473,17 +452,15 @@ def _links_counter(text: str) -> str:
 
 
 TYPE_LABEL = {"file": "config file", "folder": "configs folder",
-              "subscription": "url subscription", "links": "protocol link",
-              "all": "everything"}
+              "subscription": "url subscription", "links": "protocol link"}
 
 
 def _sources(settings) -> list:
-    """Everything that can produce configs, as one list of rows.
+    """Everything the user added, as one list of rows.
 
     Subscriptions come from the submodule's profiles.json so the command-line
     converter and the TUI stay in step; file and link sources are tuiray's own.
-    The last row is the whole configs directory, which is always there and
-    cannot be removed -- nothing the user already has can end up invisible.
+    Only these are read -- there is no catch-all directory being scanned.
     """
     rows = []
     for profile in subs.load_profiles(settings):
@@ -501,9 +478,6 @@ def _sources(settings) -> list:
         rows.append({"type": source.get("type") or "file", "name": source["name"],
                      "detail": detail, "dir": directory,
                      "count": subs.count_configs(directory), "source": source})
-    root = Path(settings.get("configs_dir") or "")
-    rows.append({"type": "all", "name": "configs directory", "detail": str(root),
-                 "dir": root, "count": subs.count_configs(root)})
     return rows
 
 
@@ -526,7 +500,7 @@ def _add_source(stdscr, settings) -> str:
     """Add a file, a folder, a subscription or pasted links; returns a config."""
     picked = ui.popup_list(stdscr, "Add", [
         ("Config file", "one .json config"),
-        ("Configs folder", "a folder of them, scanned as it is"),
+        ("Configs folder", "the *.json directly inside it"),
         ("URL subscription", "saved with its headers, fetched on demand"),
         ("Protocol link", "paste vless:// vmess:// trojan:// ss:// links"),
     ], 0)
@@ -543,7 +517,7 @@ def _add_source(stdscr, settings) -> str:
 
 def _add_path(stdscr, settings, folder: bool, source: dict = None) -> str:
     """Remember a config file or a folder of them; returns a config to use."""
-    start = (source or {}).get("path") or settings.get("configs_dir") or str(Path.home())
+    start = (source or {}).get("path") or str(Path.home())
     path = ui.file_browser(
         stdscr, start,
         "Select a folder of configs  (d takes the one you are in)" if folder
@@ -646,18 +620,9 @@ def _edit_row(stdscr, settings, row: dict) -> None:
         sources = subs.load_sources(settings)
         target = next((item for item in sources if item.get("name") == row["name"]), None)
         _add_path(stdscr, settings, folder=row["type"] == "folder", source=target)
-    else:
-        path = ui.file_browser(stdscr, settings.get("configs_dir") or str(Path.home()),
-                               "Configs directory", extensions=None, pick_dir=True)
-        if path:
-            settings.set("configs_dir", path)
 
 
 def _delete_row(stdscr, settings, row: dict) -> None:
-    if row["type"] == "all":
-        ui.popup_message(stdscr, "Cannot remove",
-                         "The configs directory is where everything lands.", ui.WARN)
-        return
     what = TYPE_LABEL.get(row["type"], row["type"])
     if not ui.popup_confirm(stdscr, "Remove", f"Remove the {what} '{row['name']}'?",
                             default_yes=False):
@@ -712,17 +677,16 @@ def configs_screen(stdscr, settings) -> str:
             selected = position == index
             style = ui.attr(ui.SELECT) if selected else ui.attr(ui.NORMAL)
             ui.fill_line(stdscr, 2 + offset, 0, width, style)
-            number = "·" if row["type"] == "all" else str(position + 1)
-            line = (f"{number:>3}  {TYPE_LABEL.get(row['type'], row['type']):<17} "
+            line = (f"{position + 1:>3}  {TYPE_LABEL.get(row['type'], row['type']):<17} "
                     f"{ui.clip(row['name'], 20):<20} {row['count']:>7}  {row['detail']}")
             ui.addstr(stdscr, 2 + offset, 1, ui.clip(line, width - 2), style)
 
-        if len(rows) == 1:                 # only the configs directory
-            ui.addstr(stdscr, 4, 3, "Nothing added yet — press a to add a config file, "
+        if not rows:
+            ui.addstr(stdscr, 3, 3, "Nothing added yet — press a to add a config file, "
                       "a subscription URL or pasted links.", ui.attr(ui.DIM))
 
         hints = ("Enter use · a add · u update · e edit · d remove · "
-                 "s show links · c use as configs dir · Esc back")
+                 "s show links · Esc back")
         ui.fill_line(stdscr, height - 1, 0, width, ui.attr(ui.HEADER))
         ui.addstr(stdscr, height - 1, 1, ui.clip(hints, width - 2), ui.attr(ui.HEADER))
         stdscr.refresh()
@@ -732,6 +696,15 @@ def configs_screen(stdscr, settings) -> str:
             continue
         if ui.is_escape(key) or key in ("q", "Q"):
             break
+        if key in ("a", "A"):
+            picked = _add_source(stdscr, settings)
+            index = 0
+            if picked:
+                chosen = picked
+                break
+            continue
+        if not rows:
+            continue
         row = rows[index]
 
         if key in (curses.KEY_UP, "k"):
@@ -742,12 +715,6 @@ def configs_screen(stdscr, settings) -> str:
             index = 0
         elif key == curses.KEY_END:
             index = len(rows) - 1
-        elif key in ("a", "A"):
-            picked = _add_source(stdscr, settings)
-            index = 0
-            if picked:
-                chosen = picked
-                break
         elif key in ("u", "U"):
             _update_row(stdscr, settings, row)
         elif key in ("e", "E"):
@@ -765,12 +732,6 @@ def configs_screen(stdscr, settings) -> str:
                                  "Nothing to turn into links here yet.", ui.WARN)
             else:
                 _show_links(stdscr, settings, row["name"], found)
-        elif key in ("c", "C"):
-            if row["dir"] and row["dir"].is_dir():
-                settings.set("configs_dir", str(row["dir"]))
-            else:
-                ui.popup_message(stdscr, "Not a folder",
-                                 "Only a folder can be the configs directory.", ui.WARN)
         elif ui.is_enter(key):
             picked = _pick_from(stdscr, settings, row)
             if picked:
@@ -815,7 +776,7 @@ def _show_links(stdscr, settings, name: str, found: list) -> None:
         elif key == curses.KEY_PPAGE:
             index -= rows
         elif key in ("w", "W"):
-            default = str(Path(settings.get("configs_dir")) / f"{subs.safe_name(name)}.txt")
+            default = str(Path.home() / f"{subs.safe_name(name)}.txt")
             path = ui.popup_input(stdscr, "Write links", "File:", default)
             if not path:
                 continue
@@ -1004,8 +965,8 @@ def settings_screen(stdscr, settings, jump_to: str = None) -> None:
             ("item", "Download / update xray",
              xrayget.installed_version(settings.get("xray_bin", "")) or "(not installed)",
              edit.download_xray()),
-            ("item", "Configs directory", settings.get("configs_dir") or "(not set)",
-             edit.dir("configs_dir", "Select configs directory")),
+            ("item", "Subscriptions folder", settings.get("configs_dir") or "(not set)",
+             edit.dir("configs_dir", "Where subscriptions and links are written")),
             ("item", "GeoIP file", asset_value(settings, "geoip_path"),
              edit.file("geoip_path", "Select geoip.dat", (".dat",))),
             ("item", "GeoSite file", asset_value(settings, "geosite_path"),

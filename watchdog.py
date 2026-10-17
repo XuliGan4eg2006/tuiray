@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 import pinger
 import runner
-import xrayconf
+import subs
 
 # state values, in the order the UI colours them
 OFF = "off"
@@ -361,7 +361,7 @@ class Watchdog:
 
     def candidates(self) -> list:
         """Configs to try, best bet first: proven ones, then untried, then duds."""
-        paths = xrayconf.list_configs(self.settings.get("configs_dir"))
+        paths = subs.all_configs(self.settings)
         current = self.settings.config_path
 
         def rank(path):
@@ -384,7 +384,7 @@ class Watchdog:
         original = self.settings.config_path
         candidates = self.candidates()
         if not candidates:
-            self._update(state=EXHAUSTED, message="no other config in the configs directory")
+            self._update(state=EXHAUSTED, message="no other config in the added sources")
             self.log.note("watchdog: nothing to switch to")
             return
 

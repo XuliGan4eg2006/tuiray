@@ -20,9 +20,9 @@ set -eu
 REPO=${TUIRAY_REPO:-https://github.com/XuliGan4eg2006/tuiray}
 REF=${TUIRAY_REF:-master}
 ROOT=${XDG_DATA_HOME:-$HOME/.local/share}/tuiray
-# The checkout sits one level down: tuiray looks *next to* its own directory
-# for the xray binary, geoip.dat and configs/, so everything it downloads ends
-# up in $ROOT rather than scattered through ~/.local/share.
+# The checkout sits one level down, next to the exported configs in
+# $ROOT/configs. The xray binary and geo data it downloads land inside the
+# checkout itself (ignored by git, so updates leave them alone).
 DIR=${TUIRAY_DIR:-$ROOT/app}
 BIN=${TUIRAY_BIN:-$HOME/.local/bin}
 LAUNCHER=$BIN/tuiray
@@ -191,7 +191,7 @@ do_uninstall() {
         step "removing $ROOT, $config and $cache"
         rm -rf "$ROOT" "$config" "$cache"
     else
-        [ -d "$ROOT" ] && note "xray, geo data and exported configs kept in $ROOT"
+        [ -d "$ROOT" ] && note "exported configs kept in $ROOT"
         note "settings kept in $config"
         note "cache kept in    $cache"
         note "remove all of it with:  sh install.sh --purge"

@@ -323,11 +323,3 @@ def write(config: dict, path: Path) -> Path:
     path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
 
-
-def list_configs(root) -> list:
-    """*.json under root, recursively, sorted by (directory, name)."""
-    root = Path(root)
-    if not root.is_dir():
-        return []
-    files = [p for p in root.rglob("*.json") if p.is_file()]
-    return sorted(files, key=lambda p: (str(p.parent), p.name))

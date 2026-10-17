@@ -252,14 +252,55 @@ def source_dir(settings, source: dict) -> Path:
     return profile_dir(settings, source.get("name") or "")
 
 
-def count_configs(directory: Path) -> int:
+def configs_in(directory) -> list:
+    """The configs of one source: the file itself, or the *.json directly in
+    the folder. Deliberately not recursive -- a folder added by mistake (say,
+    $HOME) must cost one directory listing, not a crawl of everything below.
+    """
     if not directory:
-        return 0
+        return []
+    directory = Path(directory)
     if directory.is_file():
-        return 1
+        return [directory]
     if not directory.is_dir():
-        return 0
-    return sum(1 for _ in directory.rglob("*.json"))
+        return []
+    try:
+        return sorted(p for p in directory.glob("*.json") if p.is_file())
+    except OSError:
+        return []
+
+
+def count_configs(directory: Path) -> int:
+    return len(configs_in(directory))
+
+
+def source_groups(settings) -> dict:
+    """{source name: [config paths]} for every subscription and added source.
+
+    This is the whole universe of configs the ping tool and the watchdog look
+    at; nothing outside what the user added is ever read.
+    """
+    groups = {}
+    for profile in load_profiles(settings):
+        paths = configs_in(profile_dir(settings, profile.get("name") or ""))
+        if paths:
+            groups.setdefault(profile.get("name") or "unnamed", []).extend(paths)
+    for source in load_sources(settings):
+        paths = configs_in(source_dir(settings, source))
+        if paths:
+            groups.setdefault(source["name"], []).extend(paths)
+    return groups
+
+
+def all_configs(settings) -> list:
+    """Every config of every source, each path once."""
+    seen, out = set(), []
+    for paths in source_groups(settings).values():
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
 
 
 def refresh_links(settings, source: dict) -> dict:
@@ -367,13 +408,8 @@ def share_links(settings, profile_name: str) -> list:
 def share_links_from(settings, directory) -> list:
     """The share links of every config under `directory` (or of one file)."""
     parse_response = module("parser").parse_response
-    directory = Path(directory or "")
-    if directory.is_file():
-        paths = [directory]
-    else:
-        paths = sorted(directory.rglob("*.json")) if directory.is_dir() else []
     found = []
-    for path in paths:
+    for path in configs_in(directory):
         try:
             entry = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

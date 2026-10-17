@@ -13,7 +13,9 @@ from pathlib import Path
 
 APP = "tuiray"
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent
+# The tuiray folder itself: where the xray binary and the .dat files are looked
+# for (and downloaded to). It used to be the parent, which put them in $HOME.
+REPO = HERE
 
 
 def _invoking_user() -> tuple:
@@ -79,6 +81,9 @@ def mkdir_owned(path: Path) -> Path:
 CONFIG_HOME = _xdg("XDG_CONFIG_HOME", ".config")    # KDE's kioslaverc lives here
 CONFIG_DIR = CONFIG_HOME / APP
 CACHE_DIR = _xdg("XDG_CACHE_HOME", ".cache") / APP
+# Where subscriptions and pasted links are written. Only ever written into,
+# never scanned: the configs page reads just the sources the user added.
+EXPORT_DIR = _xdg("XDG_DATA_HOME", ".local/share") / APP / "configs"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 
@@ -98,7 +103,7 @@ def _default_path(name: str) -> str:
 DEFAULTS = {
     "xray_bin": "",
     "config_path": "",          # the xray config currently selected
-    "configs_dir": "",          # where the config picker / ping tool look
+    "configs_dir": "",          # where subscriptions / links are exported to
     "geoip_path": "",
     "geosite_path": "",
     "mode": "proxy",            # "proxy" | "tun"
@@ -225,11 +230,23 @@ class Settings:
         except (OSError, json.JSONDecodeError):
             pass
 
+        # Files that older versions put next to the tuiray folder now live in
+        # it; follow them once they are there.
+        for key, name in (("xray_bin", "xray"), ("geoip_path", "geoip.dat"),
+                          ("geosite_path", "geosite.dat")):
+            value = data.get(key)
+            if value and Path(value).parent == REPO.parent and (REPO / name).is_file():
+                data[key] = str(REPO / name)
+
         # First run (or a moved repo): fill in whatever we can find locally.
         if not data["xray_bin"] or not Path(data["xray_bin"]).exists():
             data["xray_bin"] = _default_xray()
-        if not data["configs_dir"] or not Path(data["configs_dir"]).is_dir():
-            data["configs_dir"] = _default_path("configs") or str(REPO)
+        # Older versions fell back to the repo's parent -- usually $HOME -- and
+        # then crawled it for *.json on every repaint. Never export there.
+        stored_dir = data["configs_dir"]
+        if (not stored_dir or Path(stored_dir).expanduser() in (HOME, REPO, REPO.parent, Path("/"))
+                or not Path(stored_dir).expanduser().is_dir()):
+            data["configs_dir"] = str(EXPORT_DIR)
         if not data["geoip_path"] or not Path(data["geoip_path"]).exists():
             data["geoip_path"] = _default_path("geoip.dat")
         if not data["geosite_path"] or not Path(data["geosite_path"]).exists():

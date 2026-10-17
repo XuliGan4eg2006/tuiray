@@ -27,7 +27,7 @@ VERSION = "1.0"
 def parse_args():
     parser = argparse.ArgumentParser(description="nmtui-style TUI for xray")
     parser.add_argument("-c", "--config", help="xray config to preselect")
-    parser.add_argument("-d", "--configs-dir", help="directory the ping tool scans")
+    parser.add_argument("-d", "--configs-dir", help="where subscriptions and links are written")
     parser.add_argument("-m", "--mode", choices=("proxy", "tun"), help="start-up mode")
     parser.add_argument("--stop", action="store_true",
                         help="stop a running xray started by tuiray, then exit")

@@ -82,10 +82,6 @@ class App:
             parts.append(f"{added} added source{'s' if added > 1 else ''}")
         return " · ".join(parts)
 
-    def short_configs_dir(self) -> str:
-        directory = Path(self.settings.get("configs_dir") or "")
-        return f"{directory.parent.name}/{directory.name}" if directory.name else "(not set)"
-
     def sysproxy_label(self) -> str:
         if not self.settings.get("proxy.set_system_proxy"):
             return "off"
@@ -538,15 +534,12 @@ class App:
 
     def pick_config(self) -> None:
         """The configs page: every source, and the three ways to add one."""
-        before = self.settings.get("configs_dir")
         self.watchdog.pause()
         try:
             chosen = screens.configs_screen(self.stdscr, self.settings)
         finally:
             self.watchdog.resume()
         self.summary_for = None
-        if self.settings.get("configs_dir") != before:
-            self.notify(f"configs directory: {self.settings.get('configs_dir')}", 6)
         if chosen:
             self.use_config(chosen)
 
