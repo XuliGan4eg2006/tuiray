@@ -6,32 +6,7 @@ keep subscriptions up to date.
 
 Pure Python 3 + `curses` — no third-party packages.
 
-```
-  TUIray — xray control                                                 dmitry
-┌─ Connection ───────────────────────────────────┐┌─ Status ───────────────────┐
-│ ▸ Config          whit/00_Авто_Быстрый.json    ││ ● running                  │
-│   Mode            Proxy — local SOCKS + HTTP   ││ pid    12345               │
-│   System proxy    on · desktop says manual     ││ uptime 00:12:33            │
-│   Routing         LAN/private direct           ││ mode   proxy               │
-│   Share           wifi TUIray · stopped · lan… │└────────────────────────────┘
-│   Watchdog        watching · proxy 46 ms · di… │┌─ Traffic ──────────────────┐
-│                                                ││         rate     total     │
-│ ────────────────────────────────────────────── ││ ↓   1.2 MB/s  472.0 MB     │
-│   Stop xray                                    ││ ↑  43.9 KB/s   12.7 MB     │
-│   Restart                                      │└────────────────────────────┘
-│ ────────────────────────────────────────────── │┌─ Watchdog ─────────────────┐
-│   Ping configs…                                ││ ● ok                in 22s │
-│   Settings…                                    ││ proxy  46 ms               │
-│   Quit                                         ││ direct 61 ms               │
-└────────────────────────────────────────────────┘└────────────────────────────┘
-┌─ Xray log — 4 lines ─────────────────────────────────────────────────────────┐
-│ [tuiray] mode=proxy  config=…/configs/savevpn/02_Литва.json                  │
-│ 2026/09/22 12:10:26 [Warning] core: Xray 26.7.28 started                     │
-│ [tuiray] system proxy: set (GNOME)                                           │
-│ [tuiray] watchdog: proxy 46 ms · direct 61 ms                                │
-└──────────────────────────────────────────────────────────────────────────────┘
- Tab pane · Enter activate · s start/stop · R restart · p ping · u configs · w…
-```
+![](imgs//mainui.png)
 
 ## Install
 
